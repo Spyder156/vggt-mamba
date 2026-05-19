@@ -17,6 +17,7 @@ Forward returns a dict:
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Literal
 
@@ -33,6 +34,7 @@ from .aggregators import (
 from .encoders import DINOv2Encoder, DINOv3Encoder, EncoderOutput, VJEPAEncoder
 from .heads.camera import CameraHead
 from .heads.dpt import PointmapHead as DPTUpsampleHead
+from .heads.latent_predictor import LatentPredictor
 from .heads.track import TrackHead
 
 
@@ -52,6 +54,8 @@ class GeoMamba(nn.Module):
         track_enabled: bool = True,
         max_frames: int = 256,
         dense_residual_to_patches: bool = True,
+        predict_next_latent: bool = False,
+        ema_momentum: float = 0.99,
     ):
         super().__init__()
         self.encoder = encoder
@@ -97,6 +101,29 @@ class GeoMamba(nn.Module):
         )
         self.track_head: TrackHead | None = TrackHead(dim=self.dim, hidden=head_hidden) \
             if track_enabled else None
+
+        # 6. Optional world-model regularizer: predict next-frame summary tokens
+        # from the current state. Targets come from EMA copies of the online
+        # intraframe + summary encoders, with stopgrad — JEPA recipe to avoid
+        # collapse.
+        self.predict_next_latent = predict_next_latent
+        self.ema_momentum = ema_momentum
+        if predict_next_latent:
+            self.latent_predictor = LatentPredictor(dim=self.dim, hidden=head_hidden * 2)
+            # EMA-target copies of intraframe + summary_pool. requires_grad=False
+            # and .eval() so they're never updated by SGD and never use grad_ckpt.
+            self.target_intraframe = copy.deepcopy(self.intraframe)
+            self.target_summary_pool = copy.deepcopy(self.summary_pool)
+            for p in self.target_intraframe.parameters():
+                p.requires_grad_(False)
+            for p in self.target_summary_pool.parameters():
+                p.requires_grad_(False)
+            self.target_intraframe.eval()
+            self.target_summary_pool.eval()
+        else:
+            self.latent_predictor = None
+            self.target_intraframe = None
+            self.target_summary_pool = None
 
     def forward(
         self,
@@ -145,7 +172,35 @@ class GeoMamba(nn.Module):
         if self.track_head is not None and track_xy is not None and track_frame is not None:
             out["tracks"] = self.track_head(track_xy, track_frame, state_per_frame)
 
+        # 5d. World-model regularizer: predict next-frame summary tokens from state.
+        # Target = EMA-target encoder output on the same patches, stopgrad.
+        # Loss is consumed by the train script via geomamba_loss.
+        if self.predict_next_latent and self.latent_predictor is not None and t >= 2:
+            with torch.no_grad():
+                tgt_refined = self.target_intraframe(patches)                # (B, T, P, D)
+                tgt_summaries = self.target_summary_pool(tgt_refined)        # (B, T, K, D)
+            # For each t in 0..T-2: predict frame (t+1)'s summary from state_t.
+            predicted_next = self.latent_predictor(state_per_frame[:, :-1])  # (B, T-1, K, D)
+            target_next = tgt_summaries[:, 1:].detach()                       # (B, T-1, K, D)
+            out["predicted_next"] = predicted_next
+            out["target_next"] = target_next
+
         return out
+
+    @torch.no_grad()
+    def update_ema_target(self) -> None:
+        """Move the EMA-target encoders toward the online encoders.
+        Call once after every optimizer step when training with predict_next_latent.
+        """
+        if not self.predict_next_latent:
+            return
+        m = self.ema_momentum
+        for p_online, p_target in zip(self.intraframe.parameters(),
+                                      self.target_intraframe.parameters()):
+            p_target.data.mul_(m).add_(p_online.data, alpha=1.0 - m)
+        for p_online, p_target in zip(self.summary_pool.parameters(),
+                                      self.target_summary_pool.parameters()):
+            p_target.data.mul_(m).add_(p_online.data, alpha=1.0 - m)
 
     # ---------- streaming inference ----------
 
@@ -227,6 +282,8 @@ def build_geomamba(
     track_enabled: bool = True,
     max_frames: int = 256,
     dense_residual_to_patches: bool = True,
+    predict_next_latent: bool = False,
+    ema_momentum: float = 0.99,
 ) -> GeoMamba:
     weights_root = Path(weights_root)
     if encoder_name == "dinov3":
@@ -258,6 +315,8 @@ def build_geomamba(
         track_enabled=track_enabled,
         max_frames=max_frames,
         dense_residual_to_patches=dense_residual_to_patches,
+        predict_next_latent=predict_next_latent,
+        ema_momentum=ema_momentum,
     )
 
 

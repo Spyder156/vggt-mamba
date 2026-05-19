@@ -69,6 +69,7 @@ def geomamba_loss(
     w_mvc: float = 0.1,
     w_cam: float = 1.0,
     w_track: float = 1.0,
+    w_pred: float = 0.5,
     mvc_samples: int = 1024,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combined multi-task loss.
@@ -114,6 +115,14 @@ def geomamba_loss(
                         targets.get("track_valid"))
         total = total + w_track * tl
         log["loss_track"] = float(tl.detach())
+
+    # World-model regularizer (optional): predicted next-frame summary tokens
+    # vs EMA-target. MSE in latent space. JEPA recipe — target already detached.
+    if "predicted_next" in predictions and "target_next" in predictions:
+        pl = F.mse_loss(predictions["predicted_next"].float(),
+                        predictions["target_next"].float())
+        total = total + w_pred * pl
+        log["loss_pred"] = float(pl.detach())
 
     log["loss_total"] = float(total.detach())
     return total, log

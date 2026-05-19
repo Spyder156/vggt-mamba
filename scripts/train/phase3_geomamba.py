@@ -176,6 +176,8 @@ def main() -> None:
         # Allow inference-time extrapolation up to 16x training N.
         max_frames=max(cfg["data"]["n_frames"] * 16, 256),
         dense_residual_to_patches=cfg["model"].get("dense_residual_to_patches", True),
+        predict_next_latent=cfg["model"].get("predict_next_latent", False),
+        ema_momentum=cfg["model"].get("ema_momentum", 0.99),
     ).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[phase3] trainable params: {n_train/1e6:.2f}M")
@@ -242,21 +244,25 @@ def main() -> None:
                 w_mvc=cfg["loss"]["w_mvc"],
                 w_cam=cfg["loss"]["w_cam"],
                 w_track=cfg["loss"]["w_track"],
+                w_pred=cfg["loss"].get("w_pred", 0.5),
                 mvc_samples=cfg["loss"]["mvc_samples"],
             )
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
+        if hasattr(model, "update_ema_target"):
+            model.update_ema_target()
         step += 1
 
         if step % cfg["train"]["log_every"] == 0 or step == 1:
             elapsed = time.perf_counter() - t_start
             rec = {"step": step, "lr": lr_at(step), "elapsed_s": elapsed, **log_dict}
+            pred_s = f"  pred={log_dict['loss_pred']:.4f}" if "loss_pred" in log_dict else ""
             print(f"[phase3] step={step:5d}  lr={rec['lr']:.2e}  "
                   f"L1={log_dict['loss_pmap_l1']:.4f}  log={log_dict['loss_pmap_log']:.4f}  "
-                  f"mvc={log_dict['loss_mvc']:.4f}  cam={log_dict['loss_cam']:.4f}  "
-                  f"total={log_dict['loss_total']:.4f}")
+                  f"mvc={log_dict['loss_mvc']:.4f}  cam={log_dict['loss_cam']:.4f}"
+                  f"{pred_s}  total={log_dict['loss_total']:.4f}")
             log_f.write(json.dumps(rec) + "\n")
             log_f.flush()
 
