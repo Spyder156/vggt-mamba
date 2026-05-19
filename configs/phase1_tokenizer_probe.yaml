@@ -1,0 +1,36 @@
+# Phase 1 tokenizer probe — V-JEPA 2.1 ViT-L vs DINOv2 ViT-L
+# Trains Mini-3R with the chosen encoder frozen, measures multi-view consistency.
+
+encoder: vjepa            # vjepa | dinov2
+seed: 0
+
+data:
+  root: /workspace/datasets/tum_rgbd
+  n_frames: 4
+  stride_train: 8
+  stride_eval: 32
+  depth_max_m: 8.0
+
+model:
+  n_xfm_layers: 4
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+
+train:
+  steps: 4000
+  batch_size: 1            # 4-frame window per step; fp16; 16 GB VRAM
+  num_workers: 4
+  log_every: 25
+  eval_every: 500
+  ckpt_every: 1000
+  precision: bfloat16
+
+loss:
+  consistency_weight: 0.1
+  consistency_samples: 1024
+
+output_dir: experiments/phase1_tokenizer_probe

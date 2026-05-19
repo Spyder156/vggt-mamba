@@ -1,0 +1,40 @@
+services:
+  dev:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: vggt-mamba:latest
+    container_name: vggt-mamba-dev
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - VGGT_MAMBA_DATA_ROOT=/workspace/datasets
+      - PYTHONPATH=/workspace/vggt-mamba/src
+      - WANDB_DIR=/workspace/vggt-mamba/experiments/wandb
+      # Headless rendering for open3d/matplotlib in containers
+      - DISPLAY=:0
+      - MPLBACKEND=Agg
+    volumes:
+      # Repo — bind-mount so edits on host are visible inside container
+      - ..:/workspace/vggt-mamba
+      # Datasets — outside the repo, shared with other projects.
+      # Mounted at TWO paths so the host-style `data/` symlink (which targets
+      # /home/raghav/workspace/datasets) also resolves inside the container.
+      - /home/raghav/workspace/datasets:/workspace/datasets
+      - /home/raghav/workspace/datasets:/home/raghav/workspace/datasets:ro
+      # HuggingFace cache — persist across container restarts
+      - ~/.cache/huggingface:/root/.cache/huggingface
+      - ~/.cache/torch:/root/.cache/torch
+    working_dir: /workspace/vggt-mamba
+    # /dev/shm matters for PyTorch DataLoader workers
+    shm_size: "16gb"
+    ipc: host
+    stdin_open: true
+    tty: true
+    # Ports for jupyter / tensorboard / rerun
+    ports:
+      - "8888:8888"
+      - "6006:6006"
+      - "9876:9876"
+    command: ["bash"]

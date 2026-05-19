@@ -1,0 +1,40 @@
+# Phase 2.5 — train Mamba aggregator at N=16 (vs N=4 previously).
+# Goal: give the cross-frame state actual long-sequence training signal.
+# After this, per-frame Abs-Rel-vs-position slope should turn more negative
+# if the state is genuinely accumulating scene info.
+
+encoder: dinov3
+aggregator: mamba
+d_state: 128
+seed: 0
+
+data:
+  root: /workspace/datasets/tum_rgbd
+  n_frames: 16            # 4x the Phase 2 setting — the key change
+  stride_train: 16        # non-overlapping windows so each grad step sees fresh content
+  stride_eval: 32
+  depth_max_m: 8.0
+
+model:
+  n_xfm_layers: 4
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+
+train:
+  steps: 4000
+  batch_size: 1
+  num_workers: 4
+  log_every: 25
+  eval_every: 500
+  ckpt_every: 1000
+  precision: bfloat16
+
+loss:
+  consistency_weight: 0.1
+  consistency_samples: 1024
+
+output_dir: experiments/phase2_long_n_mamba

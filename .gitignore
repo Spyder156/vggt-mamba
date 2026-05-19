@@ -1,0 +1,63 @@
+# Data — symlinked to /home/raghav/workspace/datasets, never tracked
+data
+data/
+
+# Third-party clones — regenerated via scripts/clone_third_party.sh
+third_party/
+
+# Experiments / outputs
+experiments/
+wandb/
+outputs/
+runs/
+checkpoints/
+viz/output/
+*.ckpt
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# uv
+.uv-cache/
+
+# Jupyter
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+*.ipynb-meta
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Hydra
+multirun/
+.hydra/
+
+Relevant_Papers/*
