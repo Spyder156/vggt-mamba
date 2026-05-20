@@ -168,6 +168,7 @@ def main() -> None:
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
+        n_summary_dynamic=cfg["model"].get("n_summary_dynamic"),
         n_xfm_layers=cfg["model"]["n_xfm_layers"],
         d_state=cfg["model"]["d_state"],
         bidirectional=cfg["model"]["bidirectional"],

@@ -115,6 +115,7 @@ def main() -> None:
     state_a = model.init_streaming_state(batch_size=1, dtype=torch.bfloat16, device="cuda")
     abs_rel_a = []
     pred_z_a = []
+    cam_a = []
     for i, r in enumerate(recs):
         rgb, gt_d, valid = load_frame(r, img_size)
         rgb = rgb.cuda(non_blocking=True)
@@ -122,6 +123,7 @@ def main() -> None:
         pz = preds["pointmap"][0, 0, 2].float().cpu().numpy()
         abs_rel_a.append(abs_rel(pz, gt_d, valid))
         pred_z_a.append(pz)
+        cam_a.append(preds["camera"][0, 0].float().cpu().numpy())
         if (i + 1) % 200 == 0:
             print(f"  A frame {i+1}/{len(recs)}  abs_rel={abs_rel_a[-1]:.3f}")
 
@@ -146,6 +148,7 @@ def main() -> None:
 
     abs_rel_b = [float("nan")] * args.split_at
     pred_z_b = list(pred_z_a[:args.split_at])  # placeholders; we only care 500..999
+    cam_b = list(cam_a[:args.split_at])
     for i in range(args.split_at, len(recs)):
         rgb, gt_d, valid = load_frame(recs[i], img_size)
         rgb = rgb.cuda(non_blocking=True)
@@ -153,6 +156,7 @@ def main() -> None:
         pz = preds["pointmap"][0, 0, 2].float().cpu().numpy()
         abs_rel_b.append(abs_rel(pz, gt_d, valid))
         pred_z_b.append(pz)
+        cam_b.append(preds["camera"][0, 0].float().cpu().numpy())
         if (i + 1) % 200 == 0:
             print(f"  B frame {i+1}/{len(recs)}  abs_rel={abs_rel_b[-1]:.3f}")
 
@@ -164,6 +168,7 @@ def main() -> None:
     state_c = model_c.init_streaming_state(batch_size=1, dtype=torch.bfloat16, device="cuda")
     abs_rel_c = [float("nan")] * args.split_at
     pred_z_c = list(pred_z_a[:args.split_at])
+    cam_c = list(cam_a[:args.split_at])
     for i in range(args.split_at, len(recs)):
         rgb, gt_d, valid = load_frame(recs[i], img_size)
         rgb = rgb.cuda(non_blocking=True)
@@ -173,13 +178,23 @@ def main() -> None:
         pz = preds["pointmap"][0, 0, 2].float().cpu().numpy()
         abs_rel_c.append(abs_rel(pz, gt_d, valid))
         pred_z_c.append(pz)
+        cam_c.append(preds["camera"][0, 0].float().cpu().numpy())
 
     # ---- Numerical diff: B vs A (saved/loaded state) and C vs A (no state) ----
     diff_BA = []
     diff_CA = []
+    cam_diff_BA_trans = []
+    cam_diff_CA_trans = []
+    cam_diff_BA_quat = []
+    cam_diff_CA_quat = []
     for i in range(args.split_at, len(recs)):
         diff_BA.append(float(np.mean(np.abs(pred_z_b[i] - pred_z_a[i]))))
         diff_CA.append(float(np.mean(np.abs(pred_z_c[i] - pred_z_a[i]))))
+        # Camera: translation L1, quaternion L1 (4-dim)
+        cam_diff_BA_trans.append(float(np.mean(np.abs(cam_b[i][:3] - cam_a[i][:3]))))
+        cam_diff_CA_trans.append(float(np.mean(np.abs(cam_c[i][:3] - cam_a[i][:3]))))
+        cam_diff_BA_quat.append(float(np.mean(np.abs(cam_b[i][3:7] - cam_a[i][3:7]))))
+        cam_diff_CA_quat.append(float(np.mean(np.abs(cam_c[i][3:7] - cam_a[i][3:7]))))
 
     summary = {
         "abs_rel_continuous_mean": float(np.nanmean(abs_rel_a[args.split_at:])),
@@ -187,6 +202,10 @@ def main() -> None:
         "abs_rel_stateless_mean": float(np.nanmean(abs_rel_c[args.split_at:])),
         "depth_diff_BA_mean_m": float(np.mean(diff_BA)),
         "depth_diff_CA_mean_m": float(np.mean(diff_CA)),
+        "cam_trans_diff_BA_mean_m": float(np.mean(cam_diff_BA_trans)),
+        "cam_trans_diff_CA_mean_m": float(np.mean(cam_diff_CA_trans)),
+        "cam_quat_diff_BA_mean": float(np.mean(cam_diff_BA_quat)),
+        "cam_quat_diff_CA_mean": float(np.mean(cam_diff_CA_quat)),
         "state_size_bytes": state_bytes,
     }
     (args.out_dir / "state_demo.json").write_text(json.dumps({
@@ -203,6 +222,19 @@ def main() -> None:
     print(f"  Mean per-pixel depth diff to A (lower = state preserved info):")
     print(f"    B (saved/loaded): {summary['depth_diff_BA_mean_m']*1000:.2f} mm")
     print(f"    C (stateless):    {summary['depth_diff_CA_mean_m']*1000:.2f} mm")
+    print(f"  Mean camera diff to A:")
+    print(f"    B trans (saved/loaded): {summary['cam_trans_diff_BA_mean_m']*1000:.2f} mm | "
+          f"quat: {summary['cam_quat_diff_BA_mean']:.4f}")
+    print(f"    C trans (stateless):    {summary['cam_trans_diff_CA_mean_m']*1000:.2f} mm | "
+          f"quat: {summary['cam_quat_diff_CA_mean']:.4f}")
+    print(f"  ---")
+    print(f"  State contribution ratio (C-diff / B-diff, higher = state more important):")
+    if summary['depth_diff_BA_mean_m'] > 1e-9:
+        print(f"    depth: {summary['depth_diff_CA_mean_m'] / summary['depth_diff_BA_mean_m']:.1f}×")
+    print(f"    cam trans: "
+          f"{summary['cam_trans_diff_CA_mean_m'] / max(summary['cam_trans_diff_BA_mean_m'], 1e-6):.1f}×")
+    print(f"    cam quat:  "
+          f"{summary['cam_quat_diff_CA_mean'] / max(summary['cam_quat_diff_BA_mean'], 1e-6):.1f}×")
 
     # ---- Plot ----
     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)

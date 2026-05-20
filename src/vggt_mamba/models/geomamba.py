@@ -46,6 +46,7 @@ class GeoMamba(nn.Module):
         encoder: VJEPAEncoder | DINOv2Encoder | DINOv3Encoder,
         n_intraframe_layers: int = 12,
         n_summary_tokens: int = 4,
+        n_summary_dynamic: int | None = None,
         n_xfm_layers: int = 12,
         d_state: int = 128,
         bidirectional: bool = True,
@@ -64,6 +65,16 @@ class GeoMamba(nn.Module):
         self.grid_h = encoder.grid
         self.grid_w = encoder.grid
         self.n_summary = n_summary_tokens
+        # Dual-channel split: the first `n_dynamic` summary tokens drive the
+        # camera head + world-model prediction objective (smooth, predictive
+        # role); the remaining `n_summary - n_dynamic` tokens are free to
+        # specialize for the dense head (sharp, observation role).
+        # Default = n_summary_tokens (single-channel, backward compat).
+        if n_summary_dynamic is None:
+            n_summary_dynamic = n_summary_tokens
+        assert 0 < n_summary_dynamic <= n_summary_tokens, \
+            f"n_summary_dynamic={n_summary_dynamic} must be in (0, {n_summary_tokens}]"
+        self.n_dynamic = n_summary_dynamic
 
         # 1. Per-frame self-attention refinement.
         self.intraframe = IntraFrameTransformer(dim=self.dim, n_layers=n_intraframe_layers)
@@ -153,10 +164,14 @@ class GeoMamba(nn.Module):
         state_seq = self.cross_frame(seq)                                 # (B, T*K, D)
         state_per_frame = state_seq.reshape(b, t, self.n_summary, self.dim)
 
-        # 5a. Camera head — state-only.
-        cam = self.camera_head(state_per_frame)                           # (B, T, 9)
+        # 5a. Camera head — reads only the dynamic channel of state.
+        # When n_dynamic == n_summary this is a no-op slice (single-channel mode).
+        state_dynamic = state_per_frame[:, :, :self.n_dynamic]            # (B, T, K_dyn, D)
+        cam = self.camera_head(state_dynamic)                             # (B, T, 9)
 
-        # 5b. Dense (pointmap) head — patches read from state, then DPT.
+        # 5b. Dense (pointmap) head — patches read from ALL K state tokens
+        # so the observation channel can carry sharp scene detail without
+        # being constrained by the prediction loss.
         dense_in = self.dense_readout(refined, state_per_frame)           # (B, T, P, D)
         # reshape to spatial grid for DPT, then chunk over frames so the
         # bilinear upsample stays under PyTorch's INT_MAX per-call limit.
@@ -174,14 +189,17 @@ class GeoMamba(nn.Module):
 
         # 5d. World-model regularizer: predict next-frame summary tokens from state.
         # Target = EMA-target encoder output on the same patches, stopgrad.
+        # In dual-channel mode, the prediction objective applies only to the
+        # first K_dyn ("dynamic") tokens — the observation channel is free of
+        # the smoothness-inducing prediction loss.
         # Loss is consumed by the train script via geomamba_loss.
         if self.predict_next_latent and self.latent_predictor is not None and t >= 2:
             with torch.no_grad():
                 tgt_refined = self.target_intraframe(patches)                # (B, T, P, D)
                 tgt_summaries = self.target_summary_pool(tgt_refined)        # (B, T, K, D)
-            # For each t in 0..T-2: predict frame (t+1)'s summary from state_t.
-            predicted_next = self.latent_predictor(state_per_frame[:, :-1])  # (B, T-1, K, D)
-            target_next = tgt_summaries[:, 1:].detach()                       # (B, T-1, K, D)
+            kd = self.n_dynamic
+            predicted_next = self.latent_predictor(state_per_frame[:, :-1, :kd])  # (B, T-1, K_dyn, D)
+            target_next = tgt_summaries[:, 1:, :kd].detach()                       # (B, T-1, K_dyn, D)
             out["predicted_next"] = predicted_next
             out["target_next"] = target_next
 
@@ -258,10 +276,11 @@ class GeoMamba(nn.Module):
             state_seq, state = self.cross_frame.streaming_step(tokens, state)
             state_per_frame = state_seq.unsqueeze(1)                         # (1, 1, K, D)
 
-            # 5a. Camera head.
-            cam = self.camera_head(state_per_frame)                          # (1, 1, 9)
+            # 5a. Camera head — dynamic channel only (mirrors batched forward).
+            state_dynamic = state_per_frame[:, :, :self.n_dynamic]           # (1, 1, K_dyn, D)
+            cam = self.camera_head(state_dynamic)                            # (1, 1, 9)
 
-            # 5b. Dense head.
+            # 5b. Dense head — reads all K tokens (incl. observation channel).
             dense_in = self.dense_readout(refined, state_per_frame)          # (1, 1, P, D)
             grid = dense_in.reshape(1, -1, self.dim).transpose(1, 2)
             grid = grid.reshape(1, self.dim, self.grid_h, self.grid_w)
@@ -275,6 +294,7 @@ def build_geomamba(
     weights_root: str,
     n_intraframe_layers: int = 12,
     n_summary_tokens: int = 4,
+    n_summary_dynamic: int | None = None,
     n_xfm_layers: int = 12,
     d_state: int = 128,
     bidirectional: bool = True,
@@ -308,6 +328,7 @@ def build_geomamba(
         enc,
         n_intraframe_layers=n_intraframe_layers,
         n_summary_tokens=n_summary_tokens,
+        n_summary_dynamic=n_summary_dynamic,
         n_xfm_layers=n_xfm_layers,
         d_state=d_state,
         bidirectional=bidirectional,
