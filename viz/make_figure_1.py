@@ -73,6 +73,8 @@ def main() -> None:
     ours_frames = np.array([r["frame"] for r in log["log"]])
     ours_peak_mb = np.array([r["peak_vram_mb"] for r in log["log"]])
     ours_peak_gb = ours_peak_mb / 1024
+    ours_times_ms = np.array([r["time_ms"] for r in log["log"]])
+    ours_fps = 1000.0 / ours_times_ms.mean() if len(ours_times_ms) else float("nan")
     state_kb = log["state_bytes"] / 1024
     state_mb = log["state_bytes"] / 1024 / 1024
 
@@ -113,7 +115,7 @@ def main() -> None:
     # Ours — fat solid blue line.
     ax.plot(ours_frames, ours_peak_gb, "-", color="tab:blue", linewidth=3.0,
             label=f"GeoMamba streaming (ours, measured)\n     ≈ {ours_peak_gb.mean():.2f} GB peak, "
-                  f"{state_mb:.1f} MB state, 26 FPS")
+                  f"{state_mb:.1f} MB state, {ours_fps:.2f} FPS")
 
     # Highlight that the blue line is genuinely flat — annotate the state size.
     ax.text(n_max * 0.5, ours_peak_gb.mean() - 1.3,

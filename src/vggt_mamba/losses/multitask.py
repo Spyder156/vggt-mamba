@@ -71,6 +71,7 @@ def geomamba_loss(
     w_track: float = 1.0,
     w_pred: float = 0.5,
     mvc_samples: int = 1024,
+    pred_motion_weights: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combined multi-task loss.
 
@@ -118,9 +119,19 @@ def geomamba_loss(
 
     # World-model regularizer (optional): predicted next-frame summary tokens
     # vs EMA-target. MSE in latent space. JEPA recipe — target already detached.
+    # If pred_motion_weights is supplied (Experiment 1a), weight each (b, t)
+    # pair by the ego-motion magnitude between gt frame t and t+1, normalized
+    # by the batch median. Locked formula — do not retune mid-flight.
     if "predicted_next" in predictions and "target_next" in predictions:
-        pl = F.mse_loss(predictions["predicted_next"].float(),
-                        predictions["target_next"].float())
+        pn = predictions["predicted_next"].float()                          # (B, T-1, K, D)
+        tn = predictions["target_next"].float()                             # (B, T-1, K, D)
+        if pred_motion_weights is None:
+            pl = F.mse_loss(pn, tn)
+        else:
+            # pred_motion_weights: (B, T-1) — per-pair weight
+            w = pred_motion_weights.to(pn.device, pn.dtype)                 # (B, T-1)
+            elem = (pn - tn).pow(2)                                         # (B, T-1, K, D)
+            pl = (elem * w[:, :, None, None]).mean()
         total = total + w_pred * pl
         log["loss_pred"] = float(pl.detach())
 

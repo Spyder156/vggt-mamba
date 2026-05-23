@@ -31,16 +31,20 @@ COMPETITORS = [
 
 
 def main() -> None:
-    out_dir = Path("viz/output/paper_figures")
+    import os
+    out_dir = Path(os.environ.get("PAPER_FIG_DIR", "viz/output/paper_figures"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Read our streaming bench stats from log.json
+    # Read our streaming bench stats from log.json. Default to the patch-scan
+    # benches (current production architecture).
     log_files = [
         ("freiburg3_long_office_household (TRAIN seq)",
-         "viz/output/phase3_streaming_bench/log.json"),
+         "viz/output/phase3_streaming_bench_patchscan/log.json"),
         ("freiburg3_sitting_xyz (EVAL seq, held-out)",
-         "viz/output/phase3_streaming_bench_eval/log.json"),
+         "viz/output/phase3_streaming_bench_patchscan_heldout/log.json"),
     ]
+    ate_report_path = Path("viz/output/paper_figures_patchscan/ate_report.json")
+    ate_data = json.loads(ate_report_path.read_text()) if ate_report_path.exists() else None
     our_rows = []
     for tag, path in log_files:
         p = Path(path)
@@ -77,17 +81,27 @@ def main() -> None:
     # Our row
     if our_rows:
         eval_row = next((r for r in our_rows if "EVAL" in r["tag"]), our_rows[0])
-        md.append(f"| **GeoMamba (ours, this work)** | **109M** | "
-                  f"**{eval_row['abs_rel']:.3f}** | (TODO¹) | "
+        ate_cell = "(pending)"
+        ate_footnote = None
+        if ate_data is not None:
+            agg = ate_data["aggregate_across_sequences"]
+            ate_cell = f"{agg['ate_sim3_rmse_m_mean']:.3f}¹"
+            ate_footnote = (f"¹ Mean ATE Sim(3)-RMSE across {agg['n_sequences']} held-out "
+                            "TUM-dynamics sequences (sitting_xyz, sitting_static, walking_xyz, "
+                            "walking_halfsphere, walking_static). Static-scene subset: "
+                            f"{0.5 * (ate_data['per_sequence'][1]['ate_sim3']['ate_rmse_m'] + ate_data['per_sequence'][4]['ate_sim3']['ate_rmse_m']):.3f} m. "
+                            "Per-sequence breakdown below.")
+        md.append(f"| **GeoMamba (ours, this work)** | **110M** | "
+                  f"**{eval_row['abs_rel']:.3f}** | **{ate_cell}** | "
                   f"**O(1) — {eval_row['state_kb']:.0f} KB constant state** |")
-    md.append("")
-    md.append("¹ Camera ATE pending proper TUM-benchmark trajectory alignment "
-              "(Sim(3) Umeyama + APE evaluation). Will compute before submission.")
+        md.append("")
+        if ate_footnote:
+            md.append(ate_footnote)
     md.append("")
     md.append("## Honest framing")
     md.append("")
     md.append("- **Absolute quality is mediocre** at our current training scale "
-              "(109M trainable params, 2000 training steps, 7 TUM sequences). "
+              "(110M trainable params, 2000 training steps, 7 TUM sequences). "
               "Published competitors are trained on the full 13-dataset VGGT mix "
               "(Co3D, BlendedMVS, MegaDepth, ScanNet, HyperSim, MVS-Synth, "
               "OmniObject3D, PointOdyssey, ARKitScenes, WildRGB, KITTI, Spring, "
@@ -98,7 +112,7 @@ def main() -> None:
               "range as StreamVGGT (~0.06) while keeping the constant-memory advantage.")
     md.append("- **Hardware**: results above measured on RTX 5070 Ti (consumer, 16 GB). "
               "Competitors typically benchmarked on A100/H100 (datacenter, 40–80 GB). "
-              "Our streaming model runs at **26 FPS sustained on the 5070 Ti**.")
+              "Streaming FPS reported below per regime.")
     md.append("")
     md.append("## Long-sequence streaming — our setup vs competitors at N=2000")
     md.append("")
@@ -122,6 +136,27 @@ def main() -> None:
         md.append(f"| {r['tag'].split(' ')[0]} | {held} | {r['n']} | {r['fps']:.1f} | "
                   f"{r['peak_gb']:.2f} GB | {r['abs_rel']:.3f} |")
     md.append("")
+
+    if ate_data is not None:
+        md.append("## Per-sequence camera trajectory error (held-out TUM-dynamics)")
+        md.append("")
+        md.append("Sim(3) Umeyama-aligned ATE and per-frame RPE on each of the 5 held-out "
+                  "sequences. Note the static/dynamic split: static-camera scenes are "
+                  "competitive; large-motion XYZ/halfsphere sequences drag the mean.")
+        md.append("")
+        md.append("| Sequence | Frames | ATE-Sim3 RMSE ↓ | RPE δ=1 trans ↓ | RPE δ=1 rot ↓ |")
+        md.append("|---|---|---|---|---|")
+        for s in ate_data["per_sequence"]:
+            name = s["seq"].replace("rgbd_dataset_freiburg3_", "f3_")
+            md.append(f"| {name} | {s['n_frames']} | "
+                      f"{s['ate_sim3']['ate_rmse_m']:.3f} m | "
+                      f"{s['rpe_delta1']['rpe_trans_rmse_m']:.3f} m | "
+                      f"{s['rpe_delta1']['rpe_rot_rmse_deg']:.2f}° |")
+        agg = ate_data["aggregate_across_sequences"]
+        md.append(f"| **mean** | — | **{agg['ate_sim3_rmse_m_mean']:.3f} m** | "
+                  f"**{agg['rpe_trans_rmse_m_mean']:.3f} m** | "
+                  f"**{agg['rpe_rot_rmse_deg_mean']:.2f}°** |")
+        md.append("")
 
     out_path = out_dir / "table_1_comparison.md"
     out_path.write_text("\n".join(md))

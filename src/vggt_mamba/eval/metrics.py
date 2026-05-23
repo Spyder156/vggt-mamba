@@ -54,16 +54,101 @@ def normal_consistency(pred_normals: ArrayLike, gt_normals: ArrayLike) -> float:
 
 # ---------- Camera pose ----------
 
+def umeyama_sim3(P: np.ndarray, Q: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Sim(3) alignment of point set P to Q (Umeyama 1991).
+
+    Solves min_{s, R, t} || s*R @ P_i + t - Q_i ||^2. Standard for SLAM /
+    visual-odometry trajectory evaluation, which only recovers pose up to a
+    similarity transform.
+
+    Args:
+        P, Q: (N, 3) point sets, N >= 3.
+    Returns:
+        (s, R, t) where R is (3, 3), t is (3,), s is scalar.
+    """
+    assert P.shape == Q.shape and P.shape[1] == 3 and P.shape[0] >= 3
+    n = P.shape[0]
+    mu_p = P.mean(axis=0)
+    mu_q = Q.mean(axis=0)
+    Pc = P - mu_p
+    Qc = Q - mu_q
+    H = Pc.T @ Qc / n
+    U, D, Vt = np.linalg.svd(H)
+    S = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S[-1, -1] = -1
+    R = (U @ S @ Vt).T
+    var_p = (Pc ** 2).sum() / n
+    s = (D * np.diag(S)).sum() / max(var_p, 1e-12)
+    t = mu_q - s * (R @ mu_p)
+    return float(s), R, t
+
+
 def absolute_translation_error(
     pred_poses: ArrayLike, gt_poses: ArrayLike, align: str = "sim3"
-) -> float:
-    raise NotImplementedError("wire up after Phase 3")
+) -> dict:
+    """Absolute Trajectory Error after Sim(3) alignment.
+
+    Args:
+        pred_poses, gt_poses: (N, 4, 4) world-from-camera transforms.
+        align: 'sim3' (default), 'se3', or 'none'.
+    Returns dict with ate_rmse_m, ate_mean_m, ate_median_m and aligned trajectory.
+    """
+    p = _to_numpy(pred_poses)[..., :3, 3]   # (N, 3)
+    g = _to_numpy(gt_poses)[..., :3, 3]
+    if align == "sim3":
+        s, R, t = umeyama_sim3(p, g)
+        aligned = (s * (R @ p.T)).T + t
+    elif align == "se3":
+        # Force scale=1 — translation + rotation only.
+        s, R, t = umeyama_sim3(p, g)
+        aligned = ((R @ p.T)).T + t
+    elif align == "none":
+        aligned = p
+    else:
+        raise ValueError(f"unknown align mode {align!r}")
+    err = np.linalg.norm(aligned - g, axis=1)
+    return {
+        "ate_rmse_m": float(np.sqrt(np.mean(err ** 2))),
+        "ate_mean_m": float(err.mean()),
+        "ate_median_m": float(np.median(err)),
+        "n_frames": int(p.shape[0]),
+        "align": align,
+        "aligned_trajectory_m": aligned,
+    }
 
 
 def relative_pose_error(
     pred_poses: ArrayLike, gt_poses: ArrayLike, delta: int = 1
-) -> tuple[float, float]:
-    raise NotImplementedError("wire up after Phase 3")
+) -> dict:
+    """Relative Pose Error (translation + rotation) over a window of `delta` frames.
+
+    For each i: rel_pred = pred_i^-1 @ pred_{i+delta}; rel_gt analogously.
+    Error transform = rel_gt^-1 @ rel_pred. Returns RMSE of translation (m)
+    and rotation (rad).
+    """
+    p = _to_numpy(pred_poses)
+    g = _to_numpy(gt_poses)
+    assert p.shape == g.shape and p.shape[-2:] == (4, 4) and delta >= 1
+    n = p.shape[0]
+    e_trans, e_rot = [], []
+    for i in range(n - delta):
+        rel_pred = np.linalg.inv(p[i]) @ p[i + delta]
+        rel_gt = np.linalg.inv(g[i]) @ g[i + delta]
+        diff = np.linalg.inv(rel_gt) @ rel_pred
+        e_trans.append(float(np.linalg.norm(diff[:3, 3])))
+        cos = (np.trace(diff[:3, :3]) - 1.0) / 2.0
+        e_rot.append(float(np.arccos(np.clip(cos, -1.0, 1.0))))
+    et = np.asarray(e_trans)
+    er = np.asarray(e_rot)
+    return {
+        "rpe_trans_rmse_m": float(np.sqrt(np.mean(et ** 2))),
+        "rpe_rot_rmse_deg": float(np.degrees(np.sqrt(np.mean(er ** 2)))),
+        "rpe_trans_mean_m": float(et.mean()),
+        "rpe_rot_mean_deg": float(np.degrees(er.mean())),
+        "delta_frames": int(delta),
+        "n_pairs": int(len(et)),
+    }
 
 
 # ---------- Depth ----------

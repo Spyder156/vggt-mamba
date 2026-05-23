@@ -131,6 +131,91 @@ class CrossFrameMamba(nn.Module):
         return self.norm_out(stacked), state
 
 
+class GraphedStreamingScan:
+    """CUDA-graph wrapper around CrossFrameMamba.streaming_step.
+
+    Speed-fix Option B: same kernels, same order — graph capture eliminates
+    per-kernel cudaLaunchKernel overhead. Mechanically bit-perfect by
+    construction; verify empirically with the parity test before trusting.
+
+    Usage:
+        gs = GraphedStreamingScan(cross_frame, batch_size=1, K=1024,
+                                  dim=1024, dtype=torch.bfloat16)
+        gs.capture()
+        # Per-frame:
+        out, state = gs.step(tokens)    # state is gs.state (mutated in-place)
+        # Reset between sequences:
+        gs.reset_state()
+
+    Assumptions:
+      - Static K, batch_size, dtype per captured graph (re-capture if any change).
+      - mamba.step writes conv_state / ssm_state in-place (it does in mamba_ssm
+        v2.2.x — Mamba2.step holds tensor identity and writes via copy_/scatter).
+      - Caller copies new input via gs.step(); graph reads from gs.static_in.
+    """
+
+    def __init__(self, cross_frame: CrossFrameMamba, batch_size: int, K: int,
+                 dim: int, dtype: torch.dtype = torch.bfloat16, device: str = "cuda"):
+        self.cross_frame = cross_frame
+        self.B = batch_size
+        self.K = K
+        self.dim = dim
+        self.dtype = dtype
+        self.device = device
+        self.static_in = torch.zeros(batch_size, K, dim, device=device, dtype=dtype)
+        # Allocate state once and keep references — mamba.step writes in-place
+        # to these tensors so the graph captures their addresses.
+        self.state = cross_frame.init_streaming_state(
+            batch_size=batch_size, dtype=dtype, device=device,
+        )
+        self.static_out: torch.Tensor | None = None
+        self.graph: torch.cuda.CUDAGraph | None = None
+
+    @torch.no_grad()
+    def reset_state(self) -> None:
+        """Zero the state buffers in-place (preserves addresses, so graph still valid)."""
+        for s in self.state:
+            s["conv"].zero_()
+            s["ssm"].zero_()
+
+    @torch.no_grad()
+    def capture(self, warmup_iters: int = 3) -> None:
+        # Warmup: alloc workspace, JIT, settle caching allocator.
+        for _ in range(warmup_iters):
+            with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
+                out, self.state = self.cross_frame.streaming_step(self.static_in, self.state)
+        torch.cuda.synchronize()
+        self.reset_state()
+
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            with torch.amp.autocast(device_type="cuda", dtype=self.dtype):
+                captured_out, self.state = self.cross_frame.streaming_step(
+                    self.static_in, self.state
+                )
+        # static_out is the tensor produced inside the captured region — replay
+        # writes to its memory, so subsequent .step() reads return updated values.
+        self.static_out = captured_out
+        self.reset_state()
+
+    @torch.no_grad()
+    def step(self, tokens: torch.Tensor) -> tuple[torch.Tensor, "GraphedStreamingScan"]:
+        """Replay the captured graph on new input tokens.
+
+        Returns (output_view, self) — returning `self` keeps the wrapper alive
+        across frames in caller code like `out, state = state.step(tokens)`,
+        so subsequent isinstance(state, GraphedStreamingScan) dispatch still
+        picks the graphed path. Returning self.state (the underlying list)
+        would silently fall back to the loop path on frame 2+.
+        """
+        assert self.graph is not None, "call capture() before step()"
+        assert tokens.shape == self.static_in.shape, \
+            f"shape mismatch: got {tuple(tokens.shape)}, captured for {tuple(self.static_in.shape)}"
+        self.static_in.copy_(tokens.to(self.static_in.dtype))
+        self.graph.replay()
+        return self.static_out, self
+
+
 if __name__ == "__main__":
     for bidir in (False, True):
         blk = CrossFrameMamba(dim=1024, n_layers=4, d_state=128,

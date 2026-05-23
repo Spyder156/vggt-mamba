@@ -27,6 +27,7 @@ import torch.nn as nn
 from .aggregators import (
     CrossFrameMamba,
     CrossFrameTransformer,
+    GraphedStreamingScan,
     IntraFrameTransformer,
     PatchStateCrossAttn,
     SummaryTokenPooler,
@@ -57,6 +58,7 @@ class GeoMamba(nn.Module):
         dense_residual_to_patches: bool = True,
         predict_next_latent: bool = False,
         ema_momentum: float = 0.99,
+        cross_frame_target: Literal["summary", "patch"] = "summary",
     ):
         super().__init__()
         self.encoder = encoder
@@ -75,6 +77,11 @@ class GeoMamba(nn.Module):
         assert 0 < n_summary_dynamic <= n_summary_tokens, \
             f"n_summary_dynamic={n_summary_dynamic} must be in (0, {n_summary_tokens}]"
         self.n_dynamic = n_summary_dynamic
+        # Cross-frame Mamba target: either the K compact summary tokens per
+        # frame (cheap, but compressed) or the P refined patch tokens per
+        # frame (expensive, but spatially aligned — the DPT head reads from
+        # these directly without going through summary pooling).
+        self.cross_frame_target = cross_frame_target
 
         # 1. Per-frame self-attention refinement.
         self.intraframe = IntraFrameTransformer(dim=self.dim, n_layers=n_intraframe_layers)
@@ -151,30 +158,38 @@ class GeoMamba(nn.Module):
         with torch.no_grad():
             enc_out: EncoderOutput = self.encoder(flat_rgb)
         patches = enc_out.patches.reshape(b, t, -1, self.dim)            # (B, T, P, D)
+        p = patches.shape[2]
 
         # 2. Per-frame self-attn refinement.
         refined = self.intraframe(patches)                                # (B, T, P, D)
 
-        # 3. Summary tokens per frame.
-        summaries = self.summary_pool(refined)                            # (B, T, K, D)
-
-        # 4. Add frame embed, flatten, scan with Mamba.
-        summaries = summaries + self.frame_embed[:, :t]                   # broadcasts over K
-        seq = summaries.reshape(b, t * self.n_summary, self.dim)
-        state_seq = self.cross_frame(seq)                                 # (B, T*K, D)
-        state_per_frame = state_seq.reshape(b, t, self.n_summary, self.dim)
+        if self.cross_frame_target == "summary":
+            # Original path: pool to K summaries, scan T*K tokens, dense head
+            # cross-attends patches to per-frame state tokens.
+            summaries = self.summary_pool(refined)                        # (B, T, K, D)
+            summaries = summaries + self.frame_embed[:, :t]               # broadcasts over K
+            seq = summaries.reshape(b, t * self.n_summary, self.dim)
+            state_seq = self.cross_frame(seq)                             # (B, T*K, D)
+            state_per_frame = state_seq.reshape(b, t, self.n_summary, self.dim)
+            dense_in = self.dense_readout(refined, state_per_frame)       # (B, T, P, D)
+        else:
+            # Patch-scan path: scan T*P tokens directly, then pool to
+            # K summaries for the camera+predict heads. DPT reads scanned
+            # patches directly — spatially aligned, no summary bottleneck.
+            patch_in = refined + self.frame_embed[:, :t]                  # broadcasts over P
+            seq = patch_in.reshape(b, t * p, self.dim)
+            scanned = self.cross_frame(seq).reshape(b, t, p, self.dim)    # (B, T, P, D)
+            state_per_frame = self.summary_pool(scanned)                  # (B, T, K, D)
+            dense_in = scanned                                            # DPT reads patch hiddens
 
         # 5a. Camera head — reads only the dynamic channel of state.
         # When n_dynamic == n_summary this is a no-op slice (single-channel mode).
         state_dynamic = state_per_frame[:, :, :self.n_dynamic]            # (B, T, K_dyn, D)
         cam = self.camera_head(state_dynamic)                             # (B, T, 9)
 
-        # 5b. Dense (pointmap) head — patches read from ALL K state tokens
-        # so the observation channel can carry sharp scene detail without
-        # being constrained by the prediction loss.
-        dense_in = self.dense_readout(refined, state_per_frame)           # (B, T, P, D)
-        # reshape to spatial grid for DPT, then chunk over frames so the
-        # bilinear upsample stays under PyTorch's INT_MAX per-call limit.
+        # 5b. Dense (pointmap) head — reshape to spatial grid for DPT, then
+        # chunk over frames so the bilinear upsample stays under PyTorch's
+        # INT_MAX per-call limit.
         grid = dense_in.reshape(b * t, -1, self.dim).transpose(1, 2)
         grid = grid.reshape(b * t, self.dim, self.grid_h, self.grid_w)
         chunk = 8
@@ -224,16 +239,32 @@ class GeoMamba(nn.Module):
 
     @torch.no_grad()
     def init_streaming_state(self, batch_size: int = 1, dtype=torch.bfloat16,
-                             device="cuda") -> list[dict]:
+                             device="cuda", use_cuda_graphs: bool = False):
         """Zero-initialized per-layer Mamba state for streaming inference.
 
         Only valid for causal-only models (bidirectional=False).
+
+        If `use_cuda_graphs=True`, returns a GraphedStreamingScan wrapper that
+        captures the per-frame scan in a CUDA graph (Speed-B). Bit-perfect
+        equivalent to the loop path (parity verified to atol=0 over 50 frames);
+        ~6× faster on the patch-scan path because it eliminates per-kernel
+        cudaLaunchKernel overhead. streaming_forward auto-detects the wrapper
+        type and routes accordingly.
         """
         if not isinstance(self.cross_frame, CrossFrameMamba):
             raise RuntimeError("streaming_forward requires a Mamba cross-frame aggregator")
-        return self.cross_frame.init_streaming_state(
-            batch_size=batch_size, dtype=dtype, device=device,
+        if not use_cuda_graphs:
+            return self.cross_frame.init_streaming_state(
+                batch_size=batch_size, dtype=dtype, device=device,
+            )
+        # Graphed path: K = patches-per-frame in patch mode, n_summary in summary mode.
+        K = (self.grid_h * self.grid_w) if self.cross_frame_target == "patch" else self.n_summary
+        gs = GraphedStreamingScan(
+            self.cross_frame, batch_size=batch_size, K=K, dim=self.dim,
+            dtype=dtype, device=device,
         )
+        gs.capture()
+        return gs
 
     @torch.no_grad()
     def streaming_forward(
@@ -262,26 +293,42 @@ class GeoMamba(nn.Module):
             with torch.no_grad():
                 enc_out = self.encoder(rgb_frame)                            # (1, P, D)
             patches = enc_out.patches.unsqueeze(0).to(autocast_dtype)        # (1, 1, P, D)
+            p = patches.shape[2]
 
             # 2. Per-frame self-attn refinement.
             refined = self.intraframe(patches)                               # (1, 1, P, D)
 
-            # 3. Summary tokens for this frame.
-            summaries = self.summary_pool(refined)                           # (1, 1, K, D)
+            is_graphed = isinstance(state, GraphedStreamingScan)
+            if self.cross_frame_target == "summary":
+                summaries = self.summary_pool(refined)                       # (1, 1, K, D)
+                if frame_idx < self.frame_embed.shape[1]:
+                    summaries = summaries + self.frame_embed[:, frame_idx:frame_idx + 1]
+                tokens = summaries.reshape(1, self.n_summary, self.dim).to(autocast_dtype)
+                if is_graphed:
+                    state_seq, state = state.step(tokens)
+                else:
+                    state_seq, state = self.cross_frame.streaming_step(tokens, state)
+                state_per_frame = state_seq.unsqueeze(1)                     # (1, 1, K, D)
+                dense_in = self.dense_readout(refined, state_per_frame)      # (1, 1, P, D)
+            else:
+                # Patch-scan streaming: advance state by the whole frame's P patches.
+                patch_in = refined
+                if frame_idx < self.frame_embed.shape[1]:
+                    patch_in = patch_in + self.frame_embed[:, frame_idx:frame_idx + 1]
+                tokens = patch_in.reshape(1, p, self.dim).to(autocast_dtype)
+                if is_graphed:
+                    scanned, state = state.step(tokens)
+                else:
+                    scanned, state = self.cross_frame.streaming_step(tokens, state)
+                scanned = scanned.unsqueeze(1)                               # (1, 1, P, D)
+                state_per_frame = self.summary_pool(scanned)                 # (1, 1, K, D)
+                dense_in = scanned                                           # (1, 1, P, D)
 
-            # 4. Frame embed + advance Mamba state by K tokens.
-            if frame_idx < self.frame_embed.shape[1]:
-                summaries = summaries + self.frame_embed[:, frame_idx:frame_idx + 1]
-            tokens = summaries.reshape(1, self.n_summary, self.dim).to(autocast_dtype)
-            state_seq, state = self.cross_frame.streaming_step(tokens, state)
-            state_per_frame = state_seq.unsqueeze(1)                         # (1, 1, K, D)
-
-            # 5a. Camera head — dynamic channel only (mirrors batched forward).
+            # 5a. Camera head — dynamic channel only.
             state_dynamic = state_per_frame[:, :, :self.n_dynamic]           # (1, 1, K_dyn, D)
             cam = self.camera_head(state_dynamic)                            # (1, 1, 9)
 
-            # 5b. Dense head — reads all K tokens (incl. observation channel).
-            dense_in = self.dense_readout(refined, state_per_frame)          # (1, 1, P, D)
+            # 5b. Dense head.
             grid = dense_in.reshape(1, -1, self.dim).transpose(1, 2)
             grid = grid.reshape(1, self.dim, self.grid_h, self.grid_w)
             pmap = self.dpt(grid).reshape(1, 1, 3, h, w)
@@ -304,6 +351,7 @@ def build_geomamba(
     dense_residual_to_patches: bool = True,
     predict_next_latent: bool = False,
     ema_momentum: float = 0.99,
+    cross_frame_target: Literal["summary", "patch"] = "summary",
 ) -> GeoMamba:
     weights_root = Path(weights_root)
     if encoder_name == "dinov3":
@@ -338,6 +386,7 @@ def build_geomamba(
         dense_residual_to_patches=dense_residual_to_patches,
         predict_next_latent=predict_next_latent,
         ema_momentum=ema_momentum,
+        cross_frame_target=cross_frame_target,
     )
 
 

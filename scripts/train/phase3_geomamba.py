@@ -139,6 +139,9 @@ def main() -> None:
     weights_root = Path(os.environ.get("VGGT_MAMBA_DATA_ROOT", "/workspace/datasets")) / "weights"
 
     img_size = {"vjepa": 384, "dinov2": 518, "dinov3": 512}[cfg["encoder"]]
+    rand_stride = cfg["data"].get("randomize_stride")
+    if rand_stride is not None:
+        rand_stride = tuple(rand_stride)
     train_ds = TUMRGBDDataset(
         data_root, split="train",
         n_frames=cfg["data"]["n_frames"],
@@ -146,6 +149,7 @@ def main() -> None:
         frame_stride=cfg["data"]["frame_stride"],
         img_size=img_size,
         depth_max_m=cfg["data"]["depth_max_m"],
+        randomize_stride=rand_stride,
     )
     eval_ds = TUMRGBDDataset(
         data_root, split="eval",
@@ -179,6 +183,7 @@ def main() -> None:
         dense_residual_to_patches=cfg["model"].get("dense_residual_to_patches", True),
         predict_next_latent=cfg["model"].get("predict_next_latent", False),
         ema_momentum=cfg["model"].get("ema_momentum", 0.99),
+        cross_frame_target=cfg["model"].get("cross_frame_target", "summary"),
     ).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[phase3] trainable params: {n_train/1e6:.2f}M")
@@ -238,6 +243,16 @@ def main() -> None:
                 "poses_w_c": batch["poses_w_c"],
                 "camera_gt": batch["camera_gt"],
             }
+            # Pre-registered Experiment 1a loss-weighting: weight each (b, t)
+            # pred-loss pair by ‖t_gt(b, t+1) − t_gt(b, t)‖₂ / batch-median.
+            # Locked formula — do not tune.
+            pmw = None
+            if cfg["loss"].get("pred_loss_weighting") == "motion_norm":
+                tcam = batch["camera_gt"][..., :3]              # (B, T, 3) translations
+                diff = tcam[:, 1:] - tcam[:, :-1]               # (B, T-1, 3)
+                norms = diff.norm(dim=-1)                       # (B, T-1)
+                med = norms.median().clamp_min(1e-6)
+                pmw = norms / med                               # (B, T-1)
             loss, log_dict = geomamba_loss(
                 preds, targets,
                 w_l1=cfg["loss"]["w_pmap_l1"],
@@ -247,6 +262,7 @@ def main() -> None:
                 w_track=cfg["loss"]["w_track"],
                 w_pred=cfg["loss"].get("w_pred", 0.5),
                 mvc_samples=cfg["loss"]["mvc_samples"],
+                pred_motion_weights=pmw,
             )
 
         loss.backward()

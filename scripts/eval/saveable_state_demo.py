@@ -57,14 +57,22 @@ def load_model(ckpt_path: Path, weights_root: Path):
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
+        n_summary_dynamic=cfg["model"].get("n_summary_dynamic"),
         n_xfm_layers=cfg["model"]["n_xfm_layers"],
         d_state=cfg["model"]["d_state"],
         bidirectional=False,
         aggregator_name="mamba",
         track_enabled=cfg["model"]["track_enabled"],
         max_frames=ckpt["model"]["frame_embed"].shape[1],
+        dense_residual_to_patches=cfg["model"].get("dense_residual_to_patches", True),
+        predict_next_latent=cfg["model"].get("predict_next_latent", False),
+        ema_momentum=cfg["model"].get("ema_momentum", 0.99),
+        cross_frame_target=cfg["model"].get("cross_frame_target", "summary"),
     )
-    model.load_state_dict(ckpt["model"], strict=False)
+    msg = model.load_state_dict(ckpt["model"], strict=False)
+    non_enc_missing = [k for k in msg.missing_keys if not k.startswith("encoder.")]
+    if non_enc_missing or msg.unexpected_keys:
+        print(f"[load] non-encoder missing={len(non_enc_missing)}  unexpected={len(msg.unexpected_keys)}")
     return model.cuda().eval(), cfg
 
 

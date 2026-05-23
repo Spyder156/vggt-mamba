@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
                    help="compute depth Abs-Rel every N frames")
     p.add_argument("--out-dir", type=Path,
                    default=Path(__file__).resolve().parents[2] / "viz/output/phase3_streaming_bench")
+    p.add_argument("--use-cuda-graphs", action="store_true",
+                   help="route streaming_forward through GraphedStreamingScan (Speed-B)")
     return p.parse_args()
 
 
@@ -67,12 +69,17 @@ def load_streaming_model(ckpt_path: Path, weights_root: Path):
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
+        n_summary_dynamic=cfg["model"].get("n_summary_dynamic"),
         n_xfm_layers=cfg["model"]["n_xfm_layers"],
         d_state=cfg["model"]["d_state"],
         bidirectional=False,
         aggregator_name="mamba",
         track_enabled=cfg["model"]["track_enabled"],
         max_frames=ckpt["model"]["frame_embed"].shape[1],
+        dense_residual_to_patches=cfg["model"].get("dense_residual_to_patches", True),
+        predict_next_latent=cfg["model"].get("predict_next_latent", False),
+        ema_momentum=cfg["model"].get("ema_momentum", 0.99),
+        cross_frame_target=cfg["model"].get("cross_frame_target", "summary"),
     )
     msg = model.load_state_dict(ckpt["model"], strict=False)
     non_enc = [k for k in msg.missing_keys if not k.startswith("encoder.")]
@@ -104,21 +111,32 @@ def main() -> None:
 
     model, cfg = load_streaming_model(args.ckpt, args.weights_root)
     img_size = {"vjepa": 384, "dinov2": 518, "dinov3": 512}[cfg["encoder"]]
-    state = model.init_streaming_state(batch_size=1, dtype=torch.bfloat16, device="cuda")
+    state = model.init_streaming_state(batch_size=1, dtype=torch.bfloat16, device="cuda",
+                                       use_cuda_graphs=args.use_cuda_graphs)
+    if args.use_cuda_graphs:
+        print(f"[stream] using CUDA graphs (Speed-B)")
 
     # Sizes of the state tensors (kept constant throughout).
+    from vggt_mamba.models.aggregators import GraphedStreamingScan
+    state_list = state.state if isinstance(state, GraphedStreamingScan) else state
     state_bytes = sum(
         s["conv"].element_size() * s["conv"].numel() + s["ssm"].element_size() * s["ssm"].numel()
-        for s in state
+        for s in state_list
     )
-    print(f"[stream] Mamba state total: {state_bytes/1024:.1f} KB across {len(state)} layers")
+    print(f"[stream] Mamba state total: {state_bytes/1024:.1f} KB across {len(state_list)} layers")
 
     # Warmup: 3 frames to let allocator settle.
     for i in range(min(3, len(recs))):
         rgb, _, _ = load_frame(recs[i], img_size)
         rgb = rgb.cuda(non_blocking=True)
         _, state = model.streaming_forward(rgb, state, frame_idx=i)
-    state = model.init_streaming_state(batch_size=1, dtype=torch.bfloat16, device="cuda")
+    # Reset state for the measurement run. With graphs, reset_state() zeros the
+    # captured buffers in place (preserving graph validity). Without graphs, just
+    # rebuild the list.
+    if isinstance(state, GraphedStreamingScan):
+        state.reset_state()
+    else:
+        state = model.init_streaming_state(batch_size=1, dtype=torch.bfloat16, device="cuda")
 
     log: list[dict] = []
     abs_rel_log: list[dict] = []
