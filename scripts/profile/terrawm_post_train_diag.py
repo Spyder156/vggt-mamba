@@ -75,8 +75,8 @@ def load_model(ckpt_path, weights_root):
         predict_next_latent=cfg["model"].get("predict_next_latent", False),
         ema_momentum=cfg["model"].get("ema_momentum", 0.99),
         cross_frame_target=cfg["model"].get("cross_frame_target", "summary"),
-        terrawm=cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False)),
-        terrawm_motion_freqs=cfg["model"].get("motion_enc_freqs", cfg["model"].get("terrawm_motion_freqs", 64)),
+        delta_pose=cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False)),
+        motion_enc_freqs=cfg["model"].get("motion_enc_freqs", cfg["model"].get("terrawm_motion_freqs", 64)),
     )
     model.load_state_dict(ckpt["model"], strict=False)
     return model.cuda().eval(), cfg

@@ -199,8 +199,8 @@ def main() -> None:
         n_anchors=cfg["model"].get("n_anchors", 32),
         n_anchor_writes=cfg["model"].get("n_anchor_writes", 4),
         anchor_match_threshold=cfg["model"].get("anchor_match_threshold", 0.5),
-        terrawm=cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False)),
-        terrawm_motion_freqs=cfg["model"].get("motion_enc_freqs", cfg["model"].get("terrawm_motion_freqs", 64)),
+        delta_pose=cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False)),
+        motion_enc_freqs=cfg["model"].get("motion_enc_freqs", cfg["model"].get("terrawm_motion_freqs", 64)),
     ).to(device)
 
     # Optional: load a warm-start checkpoint (e.g., the 1b backbone for Exp 2).

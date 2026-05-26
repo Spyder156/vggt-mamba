@@ -59,6 +59,82 @@ def camera_loss(pred_cam: torch.Tensor, gt_cam: torch.Tensor) -> tuple[torch.Ten
     }
 
 
+def terrawm_d_loss(
+    predictions: dict[str, torch.Tensor],
+    targets: dict[str, torch.Tensor],
+    w_render_l1: float = 1.0,
+    w_render_log: float = 0.5,
+    w_bootstrap: float = 1.0,
+    w_pose: float = 1.0,
+    w_mvc: float = 0.1,
+    mvc_samples: int = 1024,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """D's loss: bootstrap-depth (write supervision) + rendered-depth (masked
+    on unwritten voxels) + delta-pose. No predictor, no VICReg, no anchor.
+
+    predictions:
+      depth:                  (B, T, H, W) rendered depth
+      depth_mask:             (B, T, H, W) bool — pixels with voxel coverage
+      bootstrap_depth_patch:  (B, T, P) per-patch write-time depth hypothesis
+      camera:                 (B, T, 9) corrected pose [t, q, fov]
+      pointmap:               (B, T, 3, H, W) for MVC
+
+    targets:
+      gt_depth_full:          (B, T, H, W) GT depth
+      gt_depth_patch:         (B, T, P)    GT per-patch depth
+      gt_depth_patch_valid:   (B, T, P)    bool
+      poses_w_c:              (B, T, 4, 4) GT world-from-camera
+      camera_delta_gt:        (B, T, 9)    GT relative motion + fov
+      valid:                  (B, T, H, W) GT depth validity mask
+    """
+    from vggt_mamba.models.heads.bootstrap_depth import bootstrap_depth_loss
+    log: dict[str, float] = {}
+
+    # 1. Rendered-depth loss. Masked: only pixels where BOTH (a) GT is valid
+    #    AND (b) voxel grid has been written to along the ray.
+    depth = predictions["depth"].float()                     # (B, T, H, W)
+    depth_mask = predictions["depth_mask"]                   # (B, T, H, W) bool
+    gt_depth_full = targets["gt_depth_full"].float()         # (B, T, H, W)
+    gt_valid = targets["valid"]                              # (B, T, H, W) bool
+    full_mask = depth_mask & gt_valid                        # (B, T, H, W)
+    eps = 1e-3
+    diff = (depth.clamp_min(eps) - gt_depth_full.clamp_min(eps)).abs()
+    render_l1 = (diff * full_mask.float()).sum() / full_mask.float().sum().clamp_min(1.0)
+    log["loss_render_l1"] = float(render_l1.detach())
+    # Scale-invariant log loss on rendered.
+    log_diff = (depth.clamp_min(eps).log() - gt_depth_full.clamp_min(eps).log())
+    render_log = (log_diff.pow(2) * full_mask.float()).sum() / full_mask.float().sum().clamp_min(1.0)
+    log["loss_render_log"] = float(render_log.detach())
+    log["depth_mask_coverage"] = float(depth_mask.float().mean().detach())
+
+    # 2. Bootstrap depth (write hypothesis) — per-patch L1 in log space, masked
+    #    on GT-valid patches. This trains the write path only; firewalled from
+    #    the rendered output by the .detach() inside the model's write.
+    bs = bootstrap_depth_loss(
+        predictions["bootstrap_depth_patch"].float(),
+        targets["gt_depth_patch"].float(),
+        targets["gt_depth_patch_valid"],
+    )
+    log["loss_bootstrap"] = float(bs.detach())
+
+    # 3. Delta-pose: corrected pose vs GT delta pose (same as TerraWM's delta
+    #    supervision). Caller passes camera_delta_gt computed once per batch.
+    cam_t, cam_log = camera_loss(predictions["camera"], targets["camera_delta_gt"])
+    log.update(cam_log)
+    log["loss_pose"] = float(cam_t.detach())
+
+    # 4. Multi-view consistency (optional, lightweight; uses Z from rendered pointmap).
+    mvc = multi_view_consistency(
+        predictions["pointmap"].float(), gt_valid, targets["poses_w_c"], n_samples=mvc_samples,
+    )
+    log["loss_mvc"] = float(mvc.detach())
+
+    total = (w_render_l1 * render_l1 + w_render_log * render_log +
+             w_bootstrap * bs + w_pose * cam_t + w_mvc * mvc)
+    log["loss_total"] = float(total.detach())
+    return total, log
+
+
 def vicreg_variance_loss(z: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
     """VICReg variance regularizer: per-dim std should be ≥ gamma.
 
