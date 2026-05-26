@@ -1,6 +1,6 @@
-"""GeoMamba quality-vs-N — the existential experiment.
+"""TerraWM quality-vs-N — the existential experiment.
 
-Loads both trained GeoMamba checkpoints (Mamba aggregator + Attention
+Loads both trained TerraWM checkpoints (Mamba aggregator + Attention
 aggregator), runs each on every EVAL sequence × multiple start frames ×
 N ∈ {4, 8, 16, 32, 64, 128, 256}. Aggregates per (model, N).
 
@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from vggt_mamba.data.tum_rgbd import EVAL_SEQS, intrinsics_for, sync_sequence  # noqa: E402
 from vggt_mamba.eval.metrics import multi_view_consistency                      # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba                            # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm                            # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,7 +73,7 @@ def load_model(ckpt_path: Path, weights_root: Path):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
     agg = cfg.get("aggregator", "mamba")
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
@@ -280,7 +280,7 @@ def main() -> None:
         ax.set_title(title)
         ax.legend()
         ax.grid(alpha=0.3)
-    fig.suptitle("GeoMamba quality vs sequence length — extrapolation test\n"
+    fig.suptitle("TerraWM quality vs sequence length — extrapolation test\n"
                  "trained at N=4, evaluated up to N=256 (64× extrapolation)", fontsize=12)
     plt.tight_layout()
     plt.savefig(args.out_dir / "quality_vs_n.png", dpi=120, bbox_inches="tight")

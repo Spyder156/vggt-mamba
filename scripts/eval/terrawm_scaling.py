@@ -1,16 +1,16 @@
-"""GeoMamba scaling benchmark — does the time/memory wedge survive
+"""TerraWM scaling benchmark — does the time/memory wedge survive
 the summary-token architecture?
 
 Phase 2's headline plot was Mini-3R's aggregator at T*P tokens — that's
-where attention's O(N²) wrecks it. GeoMamba's aggregator sees only T*K
+where attention's O(N²) wrecks it. TerraWM's aggregator sees only T*K
 (=4N) tokens, so the aggregator's compute share is tiny. The dominant
 costs shift to the per-frame components.
 
 This benchmark measures three model variants on synthetic input at
 increasing N:
-  - GeoMamba + Mamba (causal)
-  - GeoMamba + Mamba (bidirectional)
-  - GeoMamba + Attention
+  - TerraWM + Mamba (causal)
+  - TerraWM + Mamba (bidirectional)
+  - TerraWM + Attention
 
 Per-component timing breakdown so we can see which terms actually grow.
 
@@ -37,7 +37,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from vggt_mamba.models.geomamba import build_geomamba  # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,7 +60,7 @@ def _sync() -> None:
 
 
 def time_components(model, rgb: torch.Tensor) -> dict[str, float]:
-    """Manually walk GeoMamba's forward and time each block."""
+    """Manually walk TerraWM's forward and time each block."""
     b, t, _, h, w = rgb.shape
     ts: dict[str, float] = {}
 
@@ -181,19 +181,19 @@ def main() -> None:
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     variants = {
-        "GeoMamba + Mamba causal": lambda: build_geomamba(
+        "TerraWM + Mamba causal": lambda: build_terrawm(
             args.encoder, str(args.weights_root),
             n_intraframe_layers=args.n_intra, n_xfm_layers=args.n_xfm,
             d_state=128, bidirectional=False, aggregator_name="mamba",
             track_enabled=False, max_frames=max(args.n_list) + 16,
         ),
-        "GeoMamba + Mamba bidirectional": lambda: build_geomamba(
+        "TerraWM + Mamba bidirectional": lambda: build_terrawm(
             args.encoder, str(args.weights_root),
             n_intraframe_layers=args.n_intra, n_xfm_layers=args.n_xfm,
             d_state=128, bidirectional=True, aggregator_name="mamba",
             track_enabled=False, max_frames=max(args.n_list) + 16,
         ),
-        "GeoMamba + Attention": lambda: build_geomamba(
+        "TerraWM + Attention": lambda: build_terrawm(
             args.encoder, str(args.weights_root),
             n_intraframe_layers=args.n_intra, n_xfm_layers=args.n_xfm,
             bidirectional=False, aggregator_name="attention",
@@ -209,9 +209,9 @@ def main() -> None:
 
     # ---------- Plot 1: total wall time vs N ----------
     fig, ax = plt.subplots(figsize=(9, 6))
-    colors = {"GeoMamba + Mamba causal": "tab:blue",
-              "GeoMamba + Mamba bidirectional": "tab:green",
-              "GeoMamba + Attention": "tab:orange"}
+    colors = {"TerraWM + Mamba causal": "tab:blue",
+              "TerraWM + Mamba bidirectional": "tab:green",
+              "TerraWM + Attention": "tab:orange"}
     for name, rows in results.items():
         ok = [r for r in rows if r["ok"]]
         if not ok:
@@ -224,17 +224,17 @@ def main() -> None:
                 ax.axvline(r["n"], color=colors[name], linestyle="--", alpha=0.5)
 
     # Reference lines from the smallest measured point on each curve.
-    if results["GeoMamba + Mamba causal"][0]["ok"]:
-        r0 = results["GeoMamba + Mamba causal"][0]
+    if results["TerraWM + Mamba causal"][0]["ok"]:
+        r0 = results["TerraWM + Mamba causal"][0]
         n0, t0 = r0["n"], r0["total"]
-        ns = [r["n"] for r in results["GeoMamba + Mamba causal"] if r["ok"]]
+        ns = [r["n"] for r in results["TerraWM + Mamba causal"] if r["ok"]]
         ax.plot(ns, [t0 * (n / n0) for n in ns], "--", color="gray", alpha=0.4,
                 label="O(N) reference")
         ax.plot(ns, [t0 * (n / n0) ** 2 for n in ns], ":", color="gray", alpha=0.4,
                 label="O(N²) reference")
     ax.set_xscale("log", base=2); ax.set_yscale("log")
     ax.set_xlabel("frames N"); ax.set_ylabel("forward time (ms)")
-    ax.set_title("GeoMamba total forward time vs sequence length\n"
+    ax.set_title("TerraWM total forward time vs sequence length\n"
                  f"DINOv3 frozen · {args.n_intra} intraframe layers · "
                  f"{args.n_xfm} aggregator layers · 5070 Ti")
     ax.legend(); ax.grid(True, which="both", alpha=0.3)
@@ -253,7 +253,7 @@ def main() -> None:
         ax.plot(ns, mems, "o-", label=name, color=colors[name], linewidth=2, markersize=8)
     ax.set_xscale("log", base=2)
     ax.set_xlabel("frames N"); ax.set_ylabel("peak VRAM (MB)")
-    ax.set_title("GeoMamba peak VRAM vs sequence length")
+    ax.set_title("TerraWM peak VRAM vs sequence length")
     ax.legend(); ax.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
     plt.savefig(args.out_dir / "peak_vram_vs_n.png", dpi=120, bbox_inches="tight")
@@ -261,8 +261,8 @@ def main() -> None:
 
     # ---------- Plot 3: stacked component breakdown ----------
     # Pick the largest common N across the three variants.
-    common_ns = sorted({r["n"] for r in results["GeoMamba + Mamba causal"] if r["ok"]} &
-                      {r["n"] for r in results["GeoMamba + Attention"] if r["ok"]})
+    common_ns = sorted({r["n"] for r in results["TerraWM + Mamba causal"] if r["ok"]} &
+                      {r["n"] for r in results["TerraWM + Attention"] if r["ok"]})
     pick_ns = []
     if common_ns:
         # show low / mid / high if available
@@ -279,9 +279,9 @@ def main() -> None:
     components = ["encoder", "intraframe", "summary_pool",
                   "aggregator", "camera_head", "dense+dpt"]
     comp_colors = plt.cm.tab10(np.linspace(0, 0.8, len(components)))
-    variant_short = {"GeoMamba + Mamba causal": "Mamba\ncausal",
-                     "GeoMamba + Mamba bidirectional": "Mamba\nbidir",
-                     "GeoMamba + Attention": "Attn"}
+    variant_short = {"TerraWM + Mamba causal": "Mamba\ncausal",
+                     "TerraWM + Mamba bidirectional": "Mamba\nbidir",
+                     "TerraWM + Attention": "Attn"}
     for col, n in enumerate(pick_ns):
         ax = axes[col]
         labels = list(variant_short.values())

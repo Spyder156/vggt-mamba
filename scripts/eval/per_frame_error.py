@@ -33,7 +33,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from vggt_mamba.data.tum_rgbd import sync_sequence, _quat_to_rot   # noqa: E402
 from vggt_mamba.eval.metrics import umeyama_sim3                    # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba               # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm               # noqa: E402
 
 
 def parse_args():
@@ -52,7 +52,7 @@ def parse_args():
 def load_model(ckpt_path, weights_root):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],

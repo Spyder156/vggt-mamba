@@ -1,4 +1,4 @@
-# Phase 3 — full GeoMamba.
+# Phase 3 — full TerraWM.
 # DINOv3 frozen encoder + per-frame self-attn refine + summary tokens →
 # bidirectional Mamba-2 → multi-task heads (camera, pointmap, optional tracks).
 # Trained at N=16 with frame_stride=10 for real multi-view signal.
@@ -46,4 +46,4 @@ train:
   ckpt_every: 1000
   precision: bfloat16
 
-output_dir: experiments/phase3_geomamba
+output_dir: experiments/phase3_terrawm

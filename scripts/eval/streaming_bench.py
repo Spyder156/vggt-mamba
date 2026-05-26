@@ -1,7 +1,7 @@
-"""Streaming benchmark — does GeoMamba actually maintain constant memory
+"""Streaming benchmark — does TerraWM actually maintain constant memory
 as N grows?
 
-Loads the causal-only GeoMamba checkpoint, plays back a long real video one
+Loads the causal-only TerraWM checkpoint, plays back a long real video one
 frame at a time via streaming_forward, and records per-frame:
   - peak VRAM since the previous frame
   - wall time
@@ -36,7 +36,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from vggt_mamba.data.tum_rgbd import sync_sequence, intrinsics_for           # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba                         # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm                         # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,7 +65,7 @@ def load_streaming_model(ckpt_path: Path, weights_root: Path):
     cfg = ckpt["config"]
     assert cfg.get("aggregator", "mamba") == "mamba" and not cfg["model"]["bidirectional"], \
         "streaming_bench requires a causal-only Mamba checkpoint"
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
@@ -190,9 +190,9 @@ def main() -> None:
     peaks = [r["peak_vram_mb"] for r in log]
     resi = [r["resident_mb"] for r in log]
     ax.plot(frames, peaks, "-", color="tab:blue", linewidth=2,
-            label="GeoMamba streaming · peak VRAM per frame")
+            label="TerraWM streaming · peak VRAM per frame")
     ax.plot(frames, resi, "--", color="tab:blue", linewidth=1.5, alpha=0.7,
-            label="GeoMamba streaming · resident VRAM after frame")
+            label="TerraWM streaming · resident VRAM after frame")
 
     # Simulated KV-cache baselines (memory cost only, well-defined math).
     # StreamVGGT-shape: per-frame KV at the model dim. Their actual config is
@@ -208,7 +208,7 @@ def main() -> None:
 
     ax.set_xlabel("frames processed")
     ax.set_ylabel("VRAM (MB)")
-    ax.set_title(f"GeoMamba streaming memory profile · {args.seq}\n"
+    ax.set_title(f"TerraWM streaming memory profile · {args.seq}\n"
                  f"Mamba state size = {state_bytes/1024:.1f} KB · constant in N")
     ax.legend()
     ax.grid(alpha=0.3)

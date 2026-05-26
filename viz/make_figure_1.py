@@ -114,7 +114,7 @@ def main() -> None:
 
     # Ours — fat solid blue line.
     ax.plot(ours_frames, ours_peak_gb, "-", color="tab:blue", linewidth=3.0,
-            label=f"GeoMamba streaming (ours, measured)\n     ≈ {ours_peak_gb.mean():.2f} GB peak, "
+            label=f"TerraWM streaming (ours, measured)\n     ≈ {ours_peak_gb.mean():.2f} GB peak, "
                   f"{state_mb:.1f} MB state, {ours_fps:.2f} FPS")
 
     # Highlight that the blue line is genuinely flat — annotate the state size.
@@ -129,7 +129,7 @@ def main() -> None:
     ax.set_ylabel("peak VRAM (GB)")
     ax.set_title(
         "Streaming 3D reconstruction memory vs sequence length\n"
-        "GeoMamba maintains constant memory at arbitrary N · "
+        "TerraWM maintains constant memory at arbitrary N · "
         "attention-based methods grow linearly and OOM",
         fontsize=12,
     )
@@ -154,9 +154,9 @@ def main() -> None:
     ax.plot(kv_n, kv_gb, ":", color="tab:red", linewidth=1.8,
             label="full-attention KV cache (worst case)")
     ax.plot(ours_frames, ours_peak_gb, "-", color="tab:blue", linewidth=3.0,
-            label=f"GeoMamba streaming (ours)")
+            label=f"TerraWM streaming (ours)")
     ax.axhline(state_mb / 1024, color="tab:blue", linestyle=":", linewidth=1.2, alpha=0.6,
-               label=f"GeoMamba state only ({state_mb:.1f} MB)")
+               label=f"TerraWM state only ({state_mb:.1f} MB)")
     ax.axhline(16.0, color="gray", linestyle=":", linewidth=1)
     ax.text(n_max * 0.98, 16.4, "16 GB consumer cap", color="gray", ha="right", fontsize=9)
     ax.set_yscale("log")

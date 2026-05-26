@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from vggt_mamba.data.tum_rgbd import sync_sequence, _quat_to_rot, intrinsics_for  # noqa: E402
 from vggt_mamba.eval.metrics import absolute_translation_error, relative_pose_error  # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba                # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm                # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
 def load_model(ckpt_path: Path, weights_root: Path):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
@@ -68,8 +68,8 @@ def load_model(ckpt_path: Path, weights_root: Path):
         n_anchors=cfg["model"].get("n_anchors", 32),
         n_anchor_writes=cfg["model"].get("n_anchor_writes", 4),
         anchor_match_threshold=cfg["model"].get("anchor_match_threshold", 0.5),
-        terrawm=cfg["model"].get("terrawm", False),
-        terrawm_motion_freqs=cfg["model"].get("terrawm_motion_freqs", 64),
+        delta_pose=cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False)),
+        motion_enc_freqs=cfg["model"].get("motion_enc_freqs", cfg["model"].get("terrawm_motion_freqs", 64)),
     )
     msg = model.load_state_dict(ckpt["model"], strict=False)
     non_enc = [k for k in msg.missing_keys if not k.startswith("encoder.")]
@@ -120,7 +120,7 @@ def eval_one_sequence(model, cfg, data_root: Path, seq: str,
     pred_poses = []
     gt_poses = []
     raw_cam9 = []                  # for TerraWM, the raw delta predictions before integration
-    terrawm = getattr(model, "terrawm", False)
+    terrawm = getattr(model, "delta_pose", False)
     t0 = time.perf_counter()
     for i, rec in enumerate(recs):
         rgb = load_rgb(rec, img_size).cuda(non_blocking=True)

@@ -1,4 +1,4 @@
-"""Multi-task loss for GeoMamba.
+"""Multi-task loss for TerraWM.
 
 Combines:
   - depth/pointmap L1 + scale-invariant log
@@ -151,7 +151,7 @@ def anchor_consistency_loss(
     }
 
 
-def geomamba_loss(
+def terrawm_loss(
     predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
     w_l1: float = 1.0,

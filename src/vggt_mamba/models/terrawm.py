@@ -1,11 +1,12 @@
-"""GeoMamba — Phase 3 full architecture.
+"""TerraWM — full streaming architecture.
 
 Frozen encoder → per-frame self-attn → summary tokens → cross-frame
 Mamba (optionally bidirectional) → multi-task heads (camera + dense
 pointmap + optional track).
 
-Same encoder zoo as Mini-3R (DINOv3/DINOv2/V-JEPA). Mini-3R is kept for
-back-compat with Phase 1/2 work; GeoMamba is the production model.
+`delta_pose=True` switches the camera head to predict per-frame relative
+motion (Δt, Δq) instead of absolute pose, and routes a CrossJEPA-style
+motion-conditioned predictor for next-latent prediction.
 
 Forward returns a dict:
     {
@@ -45,7 +46,7 @@ from .heads.latent_predictor import LatentPredictor
 from .heads.track import TrackHead
 
 
-class GeoMamba(nn.Module):
+class TerraWM(nn.Module):
     """Full streaming 3D reconstruction model."""
 
     def __init__(
@@ -69,8 +70,8 @@ class GeoMamba(nn.Module):
         n_anchors: int = 32,
         n_anchor_writes: int = 4,
         anchor_match_threshold: float = 0.5,
-        terrawm: bool = False,
-        terrawm_motion_freqs: int = 64,
+        delta_pose: bool = False,
+        motion_enc_freqs: int = 64,
     ):
         super().__init__()
         self.encoder = encoder
@@ -138,15 +139,15 @@ class GeoMamba(nn.Module):
         # collapse.
         self.predict_next_latent = predict_next_latent
         self.ema_momentum = ema_momentum
-        self.terrawm = terrawm
+        self.delta_pose = delta_pose
         if predict_next_latent:
-            if terrawm:
+            if delta_pose:
                 # TerraWM: predictor is conditioned on camera motion between
                 # frame t and frame t+1. Frees the scene-state encoder from
                 # learning view-change physics.
                 self.latent_predictor = ConditionedNextLatentPredictor(
                     dim=self.dim, hidden=head_hidden * 2,
-                    motion_enc_freqs=terrawm_motion_freqs,
+                    motion_enc_freqs=motion_enc_freqs,
                 )
             else:
                 self.latent_predictor = LatentPredictor(dim=self.dim, hidden=head_hidden * 2)
@@ -339,7 +340,7 @@ class GeoMamba(nn.Module):
         # In dual-channel mode, the prediction objective applies only to the
         # first K_dyn ("dynamic") tokens — the observation channel is free of
         # the smoothness-inducing prediction loss.
-        # Loss is consumed by the train script via geomamba_loss.
+        # Loss is consumed by the train script via terrawm_loss.
         # Skip the predictor entirely at inference (eval-only forward passes
         # don't compute the pred loss). For TerraWM specifically, the predictor
         # also requires motion conditioning that eval callers don't supply.
@@ -348,14 +349,14 @@ class GeoMamba(nn.Module):
             and self.latent_predictor is not None
             and t >= 2
             and self.training
-            and (not self.terrawm or gt_relative_motion is not None)
+            and (not self.delta_pose or gt_relative_motion is not None)
         )
         if predictor_active:
             with torch.no_grad():
                 tgt_refined = self.target_intraframe(patches)                # (B, T, P, D)
                 tgt_summaries = self.target_summary_pool(tgt_refined)        # (B, T, K, D)
             kd = self.n_dynamic
-            if self.terrawm:
+            if self.delta_pose:
                 predicted_next = self.latent_predictor(
                     state_per_frame[:, :-1, :kd], gt_relative_motion
                 )                                                              # (B, T-1, K_dyn, D)
@@ -535,7 +536,7 @@ class GeoMamba(nn.Module):
         return out, state
 
 
-def build_geomamba(
+def build_terrawm(
     encoder_name: Literal["vjepa", "dinov2", "dinov3"],
     weights_root: str,
     n_intraframe_layers: int = 12,
@@ -555,9 +556,9 @@ def build_geomamba(
     n_anchors: int = 32,
     n_anchor_writes: int = 4,
     anchor_match_threshold: float = 0.5,
-    terrawm: bool = False,
-    terrawm_motion_freqs: int = 64,
-) -> GeoMamba:
+    delta_pose: bool = False,
+    motion_enc_freqs: int = 64,
+) -> TerraWM:
     weights_root = Path(weights_root)
     if encoder_name == "dinov3":
         enc = DINOv3Encoder(
@@ -577,7 +578,7 @@ def build_geomamba(
     else:
         raise ValueError(f"unknown encoder {encoder_name!r}")
 
-    return GeoMamba(
+    return TerraWM(
         enc,
         n_intraframe_layers=n_intraframe_layers,
         n_summary_tokens=n_summary_tokens,
@@ -596,8 +597,8 @@ def build_geomamba(
         n_anchors=n_anchors,
         n_anchor_writes=n_anchor_writes,
         anchor_match_threshold=anchor_match_threshold,
-        terrawm=terrawm,
-        terrawm_motion_freqs=terrawm_motion_freqs,
+        delta_pose=delta_pose,
+        motion_enc_freqs=motion_enc_freqs,
     )
 
 
@@ -605,7 +606,7 @@ if __name__ == "__main__":
     import os
     root = os.environ.get("VGGT_MAMBA_DATA_ROOT", "/workspace/datasets") + "/weights"
     # Small variant for smoke test
-    m = build_geomamba(
+    m = build_terrawm(
         "dinov3", root,
         n_intraframe_layers=2, n_xfm_layers=2,
         track_enabled=True,
@@ -616,6 +617,6 @@ if __name__ == "__main__":
     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         out = m(x, track_xy=q, track_frame=2)
     n_train = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    print(f"[geomamba:dinov3 small] trainable {n_train/1e6:.2f}M")
+    print(f"[terrawm:dinov3 small] trainable {n_train/1e6:.2f}M")
     for k, v in out.items():
         print(f"  {k}: {tuple(v.shape)}")

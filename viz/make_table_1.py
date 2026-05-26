@@ -91,7 +91,7 @@ def main() -> None:
                             "walking_halfsphere, walking_static). Static-scene subset: "
                             f"{0.5 * (ate_data['per_sequence'][1]['ate_sim3']['ate_rmse_m'] + ate_data['per_sequence'][4]['ate_sim3']['ate_rmse_m']):.3f} m. "
                             "Per-sequence breakdown below.")
-        md.append(f"| **GeoMamba (ours, this work)** | **110M** | "
+        md.append(f"| **TerraWM (ours, this work)** | **110M** | "
                   f"**{eval_row['abs_rel']:.3f}** | **{ate_cell}** | "
                   f"**O(1) — {eval_row['state_kb']:.0f} KB constant state** |")
         md.append("")
@@ -123,7 +123,7 @@ def main() -> None:
     md.append("| CUT3R / Stream3R / Point3R | linear in N, multi-GB | depends |")
     if our_rows:
         train_row = next((r for r in our_rows if "TRAIN" in r["tag"]), our_rows[0])
-        md.append(f"| **GeoMamba (ours)** | **{train_row['peak_gb']:.2f} GB flat** | "
+        md.append(f"| **TerraWM (ours)** | **{train_row['peak_gb']:.2f} GB flat** | "
                   f"**{train_row['fps']:.1f} FPS sustained on RTX 5070 Ti** |")
     md.append("")
 

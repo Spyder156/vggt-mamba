@@ -34,8 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 from torch.utils.data import DataLoader
 
 from vggt_mamba.data.tum_rgbd import TUMRGBDDataset, unproject_depth_to_pointmap   # noqa: E402
-from vggt_mamba.losses.multitask import geomamba_loss                               # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba                               # noqa: E402
+from vggt_mamba.losses.multitask import terrawm_loss                               # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm                               # noqa: E402
 from vggt_mamba.models.pose_utils import gt_relative_motion_from_abs_poses          # noqa: E402
 
 
@@ -110,7 +110,7 @@ def main():
 
     # ===== Build model =====
     print("[smoke] building TerraWM model + loading 1b warm-start...")
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], "/workspace/datasets/weights",
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
@@ -124,8 +124,8 @@ def main():
         predict_next_latent=cfg["model"]["predict_next_latent"],
         ema_momentum=cfg["model"]["ema_momentum"],
         cross_frame_target=cfg["model"]["cross_frame_target"],
-        terrawm=True,
-        terrawm_motion_freqs=cfg["model"]["terrawm_motion_freqs"],
+        delta_pose=True,
+        motion_enc_freqs=cfg["model"]["motion_enc_freqs"],
     ).to(device)
     warm = torch.load(cfg["load_ckpt"], map_location=device, weights_only=False)
     warm_sd = warm["model"]
@@ -183,7 +183,7 @@ def main():
             "camera_gt": batch["camera_gt"],
             "camera_delta_gt": camera_delta_gt,
         }
-        loss, log = geomamba_loss(
+        loss, log = terrawm_loss(
             preds, targets, w_track=0,
             w_pred=cfg["loss"]["w_pred"],
             w_vic_var=cfg["loss"]["w_vic_var"],

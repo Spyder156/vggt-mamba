@@ -1,8 +1,8 @@
-"""Phase 3 — train GeoMamba (full architecture) on TUM-RGBD.
+"""Phase 3 — train TerraWM (full architecture) on TUM-RGBD.
 
 Usage:
-    ./docker/run.sh python scripts/train/phase3_geomamba.py \\
-        --config configs/phase3_geomamba.yaml
+    ./docker/run.sh python scripts/train/phase3_terrawm.py \\
+        --config configs/phase3_terrawm.yaml
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from vggt_mamba.data.tum_rgbd import TUMRGBDDataset, unproject_depth_to_pointmap  # noqa: E402
-from vggt_mamba.losses.multitask import geomamba_loss                              # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba                              # noqa: E402
+from vggt_mamba.losses.multitask import terrawm_loss                              # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm                              # noqa: E402
 from vggt_mamba.models.pose_utils import gt_relative_motion_from_abs_poses         # noqa: E402
 
 
@@ -82,7 +82,7 @@ def _dump_eval_viz(batch, predictions, step: int, viz_dir: Path):
         axes[1, k].imshow(gtm, cmap="viridis", vmin=0, vmax=vmax); axes[1, k].axis("off")
         axes[2, k].imshow(np.clip(pred[i], 0, vmax), cmap="viridis", vmin=0, vmax=vmax)
         axes[2, k].axis("off")
-    fig.suptitle(f"GeoMamba  step={step}", fontsize=10)
+    fig.suptitle(f"TerraWM  step={step}", fontsize=10)
     plt.tight_layout()
     plt.savefig(viz_dir / f"step_{step:06d}_preds.png", dpi=110, bbox_inches="tight")
     plt.close(fig)
@@ -92,7 +92,7 @@ def _dump_eval_viz(batch, predictions, step: int, viz_dir: Path):
 def evaluate(model, loader, device, max_batches: int = 30, viz_dir: Path | None = None,
              step: int = 0) -> dict:
     model.eval()
-    terrawm = getattr(model, "terrawm", False)
+    terrawm = getattr(model, "delta_pose", False)
     abs_rels, cams = [], []
     first = None
     for i, batch in enumerate(loader):
@@ -179,7 +179,7 @@ def main() -> None:
     eval_loader = DataLoader(eval_ds, batch_size=1, shuffle=False, num_workers=2,
                              pin_memory=True)
 
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
@@ -199,8 +199,8 @@ def main() -> None:
         n_anchors=cfg["model"].get("n_anchors", 32),
         n_anchor_writes=cfg["model"].get("n_anchor_writes", 4),
         anchor_match_threshold=cfg["model"].get("anchor_match_threshold", 0.5),
-        terrawm=cfg["model"].get("terrawm", False),
-        terrawm_motion_freqs=cfg["model"].get("terrawm_motion_freqs", 64),
+        terrawm=cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False)),
+        terrawm_motion_freqs=cfg["model"].get("motion_enc_freqs", cfg["model"].get("terrawm_motion_freqs", 64)),
     ).to(device)
 
     # Optional: load a warm-start checkpoint (e.g., the 1b backbone for Exp 2).
@@ -324,7 +324,7 @@ def main() -> None:
 
         # TerraWM: precompute GT per-frame relative motion (Δt, Δq).
         # Used both as predictor conditioning input AND as camera supervision target.
-        terrawm_mode = cfg["model"].get("terrawm", False)
+        terrawm_mode = cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False))
         gt_delta_motion = None
         camera_delta_gt = None
         if terrawm_mode:
@@ -363,7 +363,7 @@ def main() -> None:
                 norms = diff.norm(dim=-1)                       # (B, T-1)
                 med = norms.median().clamp_min(1e-6)
                 pmw = norms / med                               # (B, T-1)
-            loss, log_dict = geomamba_loss(
+            loss, log_dict = terrawm_loss(
                 preds, targets,
                 w_l1=cfg["loss"]["w_pmap_l1"],
                 w_log=cfg["loss"]["w_pmap_log"],

@@ -39,8 +39,8 @@ from torch.utils.data import DataLoader
 from vggt_mamba.data.tum_rgbd import (                                          # noqa: E402
     TUMRGBDDataset, sync_sequence, unproject_depth_to_pointmap, _quat_to_rot,
 )
-from vggt_mamba.losses.multitask import geomamba_loss                            # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba                            # noqa: E402
+from vggt_mamba.losses.multitask import terrawm_loss                            # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm                            # noqa: E402
 from vggt_mamba.models.pose_utils import gt_relative_motion_from_abs_poses       # noqa: E402
 
 
@@ -61,7 +61,7 @@ def parse_args():
 def load_model(ckpt_path, weights_root):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
@@ -75,8 +75,8 @@ def load_model(ckpt_path, weights_root):
         predict_next_latent=cfg["model"].get("predict_next_latent", False),
         ema_momentum=cfg["model"].get("ema_momentum", 0.99),
         cross_frame_target=cfg["model"].get("cross_frame_target", "summary"),
-        terrawm=cfg["model"].get("terrawm", False),
-        terrawm_motion_freqs=cfg["model"].get("terrawm_motion_freqs", 64),
+        terrawm=cfg["model"].get("delta_pose", cfg["model"].get("terrawm", False)),
+        terrawm_motion_freqs=cfg["model"].get("motion_enc_freqs", cfg["model"].get("terrawm_motion_freqs", 64)),
     )
     model.load_state_dict(ckpt["model"], strict=False)
     return model.cuda().eval(), cfg
@@ -100,7 +100,7 @@ def main():
     model, cfg = load_model(args.ckpt, args.weights_root)
     img_size = {"vjepa": 384, "dinov2": 518, "dinov3": 512}[cfg["encoder"]]
     print(f"[diag] loaded TerraWM ckpt: {args.ckpt}")
-    print(f"[diag]   terrawm={model.terrawm}, n_summary={model.n_summary}, "
+    print(f"[diag]   terrawm={model.delta_pose}, n_summary={model.n_summary}, "
           f"n_dynamic={model.n_dynamic}")
 
     diag = {}

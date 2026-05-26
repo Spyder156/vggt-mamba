@@ -1,6 +1,6 @@
 """End-to-end Speed-B integration parity test.
 
-Runs GeoMamba.streaming_forward both ways (use_cuda_graphs=False vs True) on
+Runs TerraWM.streaming_forward both ways (use_cuda_graphs=False vs True) on
 the same N-frame input sequence and compares per-frame outputs (camera +
 pointmap). Stronger than the layer-level parity because it catches any
 integration bug introduced by the streaming_forward dispatch logic.
@@ -19,7 +19,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
-from vggt_mamba.models.geomamba import build_geomamba  # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm  # noqa: E402
 
 
 def parse_args():
@@ -34,7 +34,7 @@ def parse_args():
 def load_model(ckpt_path, weights_root):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],
