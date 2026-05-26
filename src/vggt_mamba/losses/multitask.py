@@ -15,8 +15,9 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from vggt_mamba.eval.metrics import multi_view_consistency
+from vggt_mamba.eval.metrics import multi_view_consistency, project_points_to_pixels
 from vggt_mamba.losses.pointmap import pointmap_l1_loss, pointmap_log_loss
+from vggt_mamba.models.aggregators.anchor_pool import cam9_to_pose_w_c
 
 
 def _quat_geodesic_loss(pred_q: torch.Tensor, gt_q: torch.Tensor) -> torch.Tensor:
@@ -32,7 +33,14 @@ def _quat_geodesic_loss(pred_q: torch.Tensor, gt_q: torch.Tensor) -> torch.Tenso
 
 
 def camera_loss(pred_cam: torch.Tensor, gt_cam: torch.Tensor) -> tuple[torch.Tensor, dict]:
-    """pred_cam, gt_cam: (B, T, 9)  [tx,ty,tz,qx,qy,qz,qw,fovx,fovy]."""
+    """pred_cam, gt_cam: (B, T, 9)  [tx,ty,tz,qx,qy,qz,qw,fovx,fovy].
+
+    For absolute-pose mode, gt_cam is per-frame world-from-camera pose components.
+    For TerraWM delta mode, both pred_cam and gt_cam are per-frame relative
+    motion from frame t-1 to frame t (with frame 0 = identity); FOV stays absolute.
+    The math is the same — the *interpretation* of the targets is what changes,
+    and that's the caller's responsibility.
+    """
     pred_t = pred_cam[..., :3]
     gt_t = gt_cam[..., :3]
     pred_q = pred_cam[..., 3:7]
@@ -51,6 +59,32 @@ def camera_loss(pred_cam: torch.Tensor, gt_cam: torch.Tensor) -> tuple[torch.Ten
     }
 
 
+def vicreg_variance_loss(z: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
+    """VICReg variance regularizer: per-dim std should be ≥ gamma.
+
+    z: any shape ending in (..., D). Flattens all leading dims as batch.
+    Loss = mean over D of max(0, gamma - std(z_d)).
+    """
+    flat = z.reshape(-1, z.shape[-1]).float()
+    # eps inside sqrt for numerical stability
+    std = (flat.var(dim=0, unbiased=False) + 1e-4).sqrt()                 # (D,)
+    return torch.relu(gamma - std).mean()
+
+
+def vicreg_covariance_loss(z: torch.Tensor) -> torch.Tensor:
+    """VICReg covariance regularizer: off-diagonal covariance → 0.
+
+    Computes sum_{i≠j} cov(z)[i,j]² / D.
+    """
+    flat = z.reshape(-1, z.shape[-1]).float()
+    flat = flat - flat.mean(dim=0, keepdim=True)
+    N = flat.shape[0]
+    D = flat.shape[1]
+    cov = (flat.T @ flat) / max(N - 1, 1)                                  # (D, D)
+    off_diag_sq = (cov.pow(2).sum() - cov.diagonal().pow(2).sum())
+    return off_diag_sq / D
+
+
 def track_loss(pred_tracks: torch.Tensor, gt_tracks: torch.Tensor,
                valid: torch.Tensor | None = None) -> torch.Tensor:
     """L1 in normalized image coordinates. (B, T, 2)."""
@@ -59,6 +93,62 @@ def track_loss(pred_tracks: torch.Tensor, gt_tracks: torch.Tensor,
     diff = (pred_tracks - gt_tracks).abs().sum(dim=-1)        # (B, T)
     m = valid.float()
     return (diff * m).sum() / m.sum().clamp_min(1.0)
+
+
+def anchor_consistency_loss(
+    predictions: dict[str, torch.Tensor],
+    threshold: float = 0.5,
+    img_size_px: float = 512.0,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Re-projection error for matched (patch, anchor) pairs above threshold.
+
+    predictions must contain:
+      camera:           (B, T, 9) — the corrected pose
+      anchor_scores:    (B, T, P, K_a) — match scores in (0, 1)
+      anchor_positions: (B, T, K_a, 3) — anchor world positions BEFORE the
+                        current frame's write (so what was actually visible
+                        to the read step).
+      patch_pixel:      (B, P, 2) — pixel center per patch
+      K_intrinsics:     (B, 3, 3)
+
+    Loss = mean over matched pairs of score * ||proj(anchor_pos, pose) - patch_pixel||²,
+    in normalized image coordinates (divided by img_size). Mask out behind-camera
+    projections and invalid anchors (which already have score=0).
+    """
+    cam = predictions["camera"]                                     # (B, T, 9)
+    scores = predictions["anchor_scores"]                            # (B, T, P, K_a)
+    anchor_pos = predictions["anchor_positions"].float()             # (B, T, K_a, 3)
+    patch_pixel = predictions["patch_pixel"].float()                 # (B, P, 2)
+    K = predictions["K_intrinsics"].float()                          # (B, 3, 3)
+    B, T, P, K_a = scores.shape
+
+    # Build (B, T, 4, 4) pose stack and (B, T, 3, 3) K stack.
+    poses_w_c = cam9_to_pose_w_c(cam)                                # (B, T, 4, 4)
+    K_bt = K.unsqueeze(1).expand(B, T, 3, 3).contiguous()
+
+    # Project all K_a anchors through each (B, T) pose.
+    anchor_pix, in_front = project_points_to_pixels(anchor_pos, poses_w_c, K_bt)
+    # anchor_pix: (B, T, K_a, 2)
+    # Broadcast diff: (B, T, 1, K_a, 2) - (B, 1, P, 1, 2) → ... wait, need both in same shape
+    pp = patch_pixel.unsqueeze(1).unsqueeze(-2)                      # (B, 1, P, 1, 2)
+    ap = anchor_pix.unsqueeze(2)                                     # (B, T, 1, K_a, 2)
+    pix_diff_sq = ((pp - ap) ** 2).sum(dim=-1)                       # (B, T, P, K_a)
+    # Normalize by image size so the loss is in roughly [0, 1] units.
+    pix_diff_norm = pix_diff_sq / (img_size_px ** 2)
+    # Mask: only count pairs with score>threshold AND anchor projects in front.
+    score_mask = (scores > threshold).float()                        # (B, T, P, K_a)
+    in_front_mask = in_front.unsqueeze(2).float()                    # (B, T, 1, K_a)
+    mask = score_mask * in_front_mask
+    weighted = scores * pix_diff_norm * mask
+    n_valid = mask.sum().clamp_min(1.0)
+    loss = weighted.sum() / n_valid
+    n_matches = float(score_mask.sum().detach())
+    return loss, {
+        "loss_anchor_consistency": float(loss.detach()),
+        "anchor_n_matches": n_matches,
+        "anchor_mean_score": float(scores.mean().detach()),
+        "anchor_max_score": float(scores.max().detach()),
+    }
 
 
 def geomamba_loss(
@@ -70,8 +160,13 @@ def geomamba_loss(
     w_cam: float = 1.0,
     w_track: float = 1.0,
     w_pred: float = 0.5,
+    w_anchor: float = 0.5,
+    w_vic_var: float = 0.0,            # VICReg variance reg (TerraWM)
+    w_vic_cov: float = 0.0,            # VICReg covariance reg (TerraWM)
+    anchor_threshold: float = 0.5,
     mvc_samples: int = 1024,
     pred_motion_weights: torch.Tensor | None = None,
+    cam_target_key: str = "camera_gt", # "camera_gt" for absolute, "camera_delta_gt" for TerraWM
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Combined multi-task loss.
 
@@ -103,8 +198,11 @@ def geomamba_loss(
                                  targets["poses_w_c"], n_samples=mvc_samples)
     log["loss_mvc"] = float(mvc.detach())
 
-    # Camera.
-    cam_t, cam_log = camera_loss(predictions["camera"], targets["camera_gt"])
+    # Camera. In TerraWM mode the predicted camera output is interpreted as
+    # per-frame relative motion (Δt, Δq, fov) and the GT key is "camera_delta_gt";
+    # in absolute mode it's per-frame world-from-camera and the key is "camera_gt".
+    cam_gt = targets[cam_target_key]
+    cam_t, cam_log = camera_loss(predictions["camera"], cam_gt)
     log.update(cam_log)
     log["loss_cam"] = float(cam_t.detach())
 
@@ -134,6 +232,32 @@ def geomamba_loss(
             pl = (elem * w[:, :, None, None]).mean()
         total = total + w_pred * pl
         log["loss_pred"] = float(pl.detach())
+
+        # VICReg variance + covariance regs (TerraWM). Applied to both predictor
+        # output and EMA target to prevent collapse on either side. Default w=0
+        # means no-op for non-TerraWM configs.
+        if w_vic_var > 0.0 or w_vic_cov > 0.0:
+            var_p = vicreg_variance_loss(pn, gamma=1.0)
+            var_t = vicreg_variance_loss(tn, gamma=1.0)
+            cov_p = vicreg_covariance_loss(pn)
+            cov_t = vicreg_covariance_loss(tn)
+            total = total + w_vic_var * (var_p + var_t) + w_vic_cov * (cov_p + cov_t)
+            log["vic_var_pred"] = float(var_p.detach())
+            log["vic_var_target"] = float(var_t.detach())
+            log["vic_cov_pred"] = float(cov_p.detach())
+            log["vic_cov_target"] = float(cov_t.detach())
+            # Diagnostic: predictor output's per-dim std (mean over D).
+            # Healthy values are around 1.0 (matching VICReg γ=1).
+            with torch.no_grad():
+                std_pred = pn.reshape(-1, pn.shape[-1]).float().std(dim=0).mean()
+                log["predictor_dim_std"] = float(std_pred)
+
+    # Anchor-pool consistency loss (Experiment 2). Only fires if the model
+    # emitted anchor_scores in its predictions.
+    if "anchor_scores" in predictions:
+        anc_l, anc_log = anchor_consistency_loss(predictions, threshold=anchor_threshold)
+        total = total + w_anchor * anc_l
+        log.update(anc_log)
 
     log["loss_total"] = float(total.detach())
     return total, log
