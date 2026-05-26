@@ -1,0 +1,80 @@
+# TerraWM-D MVP — voxel-grid world model on TUM-RGBD.
+#
+# Architecture rebuild after the recurrent-latent went inert three times.
+# The voxel grid is the only place scene info can live; every per-frame
+# output structurally routes through it.
+#
+# Pre-registered MVP verdict (locked, same discipline as A):
+#   Protocol: stream sitting_xyz, reset voxel grid (zero features + write_mass)
+#     at frame 200, measure post-reset mean Δt-magnitude difference between
+#     continuous and reset runs over frames 200–249.
+#   Threshold (LOCKED): ≥ 0.10 m  (50× TerraWM baseline of 0.00192 m)
+#   Reasoning: structural-rebuild should make state-dependence catastrophic,
+#     not just measurable. If D's reset-impact is < 0.10 m, the voxel grid
+#     is not actually load-bearing despite the architectural commitment, and
+#     the project pivots fundamentally (4th inert result = pattern, not noise).
+#
+# Why pose not depth for the ablation: zeroing the voxel grid kills rendered
+# depth's input, but the loss mask gates it out so depth-diff goes to
+# zero/undefined. Pose comes from render-and-compare, which arithmetically
+# cannot work with a zero grid. That's the test that exercises the no-bypass
+# property.
+
+encoder: dinov3
+seed: 0
+
+data:
+  root: /workspace/datasets/tum_rgbd
+  n_frames: 8
+  stride_train: 8
+  stride_eval: 16
+  frame_stride: 10
+  randomize_stride: [10, 30]      # carry forward — keeps motion variety
+  depth_max_m: 8.0
+
+model:
+  n_intraframe_layers: 4
+  # 8×8×8 m cube, 64³ voxels = 12.5 cm voxel size. Documented assumption:
+  # camera trajectory must stay within this volume around frame 0 (TUM-Freiburg3
+  # rooms fit comfortably).
+  voxel_bounds: [-4.0, -4.0, -4.0, 4.0, 4.0, 4.0]
+  voxel_resolution: [64, 64, 64]
+  voxel_feature_dim: 32
+  # Render config
+  n_render_samples: 64
+  render_near: 0.1
+  render_far: 8.0
+  # Bootstrap depth head (write-only firewall)
+  bootstrap_hidden: 128
+  bootstrap_max_depth: 10.0
+  # Render-and-compare pose head
+  pose_head_hidden: 256
+  pose_max_dt: 0.30
+  pose_max_dq: 0.15
+  # Unwritten-voxel loss-mask threshold
+  unwritten_mask_threshold: 0.001
+
+loss:
+  w_render_l1: 1.0
+  w_render_log: 0.5
+  w_bootstrap: 1.0
+  w_pose: 1.0
+  w_mvc: 0.1
+  mvc_samples: 512               # smaller MVC sampling — D's forward is heavier
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+
+train:
+  steps: 2000
+  batch_size: 1
+  num_workers: 4
+  log_every: 25
+  eval_every: 500
+  ckpt_every: 1000
+  precision: bfloat16
+
+output_dir: experiments/phase4_terrawm_d_seed0
