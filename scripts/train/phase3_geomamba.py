@@ -294,13 +294,33 @@ def main() -> None:
         for g in opt.param_groups:
             g["lr"] = lr_at(step)
 
-        # Optional masked-frame regularizer — randomly zero one frame's RGB
-        # so the model has to rely on Mamba state + cross-frame readout to
-        # predict that frame's depth. Forces the state to carry useful info.
-        mask_p = cfg["loss"].get("mask_frame_prob", 0.0)
-        if mask_p > 0 and torch.rand(1).item() < mask_p:
-            t_mask = int(torch.randint(0, batch["rgb"].shape[1], (1,)).item())
-            batch["rgb"][:, t_mask] = 0.0
+        # Masked-frame regularizer. Two modes:
+        #   - mask_per_frame_independent=True (Experiment A): each frame in the
+        #     window is independently masked with probability mask_p. At mask_p=0.7,
+        #     ~5.6/8 frames are blank — forces the model to predict depth/pose
+        #     from the recurrent state for masked frames. Guarantees at least
+        #     one frame visible per window so the loss stays learnable.
+        #   - else (legacy): mask at most ONE frame per window with probability mask_p.
+        # mask_frame_prob_schedule: [start, end] for linear ramp over training.
+        sched = cfg["loss"].get("mask_frame_prob_schedule")
+        if sched is not None:
+            t_frac = min(step / max(cfg["train"]["steps"] - 1, 1), 1.0)
+            mask_p = float(sched[0] + (sched[1] - sched[0]) * t_frac)
+        else:
+            mask_p = cfg["loss"].get("mask_frame_prob", 0.0)
+        if mask_p > 0:
+            if cfg["loss"].get("mask_per_frame_independent", False):
+                T = batch["rgb"].shape[1]
+                mask = (torch.rand(T) < mask_p)
+                if mask.all():
+                    # Guarantee at least one visible frame; un-mask a random one.
+                    mask[int(torch.randint(0, T, (1,)).item())] = False
+                for ti in range(T):
+                    if mask[ti].item():
+                        batch["rgb"][:, ti] = 0.0
+            elif torch.rand(1).item() < mask_p:
+                t_mask = int(torch.randint(0, batch["rgb"].shape[1], (1,)).item())
+                batch["rgb"][:, t_mask] = 0.0
 
         # TerraWM: precompute GT per-frame relative motion (Δt, Δq).
         # Used both as predictor conditioning input AND as camera supervision target.
