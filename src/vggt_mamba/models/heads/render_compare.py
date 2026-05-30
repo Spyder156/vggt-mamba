@@ -93,9 +93,16 @@ class RenderCompareHead(nn.Module):
         current_patches: torch.Tensor,   # (B, P, patch_dim) current frame's intra-attended patches
         rendered_feature: torch.Tensor,  # (B, P, voxel_dim) voxel-rendered per-patch features at initial pose
         ray_total_weight: torch.Tensor,  # (B, P) cumulative weight from rendering (0 = ray hit nothing)
-        initial_pose: torch.Tensor,      # (B, 9) [tx,ty,tz, qx,qy,qz,qw, fovx,fovy] initial estimate
+        initial_pose: torch.Tensor,      # (B, 9) fov passes through; the rest is unused (delta is camera-frame)
     ) -> torch.Tensor:
-        """Returns (B, 9) corrected pose. fov passed through unchanged from initial."""
+        """Returns (B, 9) DELTA pose: per-frame relative motion in the
+        previous-frame's camera coordinates. fov is passed through unchanged.
+
+        Output is camera_delta semantics — directly comparable to
+        `gt_relative_motion_from_abs_poses` output for the per-frame pose loss.
+        To recover the absolute world-from-camera pose at frame t, caller
+        composes: T_world_t = T_world_{t-1} @ cam9_to_pose_w_c(delta_9).
+        """
         B = current_patches.shape[0]
         current_proj = self.current_proj(current_patches)                       # (B, P, voxel_dim)
         diff = current_proj - rendered_feature                                  # (B, P, voxel_dim)
@@ -114,17 +121,17 @@ class RenderCompareHead(nn.Module):
         # guarantee that closes the bypass route through LayerNorm/Linear
         # biases that produce non-zero output even on zero input.
         delta_raw = delta_raw * coverage                                         # (B, 7)
-        dt = torch.tanh(delta_raw[:, :3]) * self.max_dt                         # (B, 3) bounded
-        dq_perturb = torch.tanh(delta_raw[:, 3:7]) * self.max_dq                # (B, 4) small-angle
-        # Compose: corrected_t = initial_t + dt; corrected_q = (init_q + dq_perturb).norm
-        init_t = initial_pose[:, :3].float()
-        init_q = initial_pose[:, 3:7].float()
+        dt = torch.tanh(delta_raw[:, :3]) * self.max_dt                         # (B, 3) bounded camera-frame delta translation
+        dq_perturb = torch.tanh(delta_raw[:, 3:7]) * self.max_dq                # (B, 4) small-angle quat perturbation
+        # Delta quaternion: identity baseline (0,0,0,1) + small perturbation, renormalized.
+        # With zero-init MLP, dq_perturb=0 -> delta_q=(0,0,0,1) = identity rotation.
+        identity_q = torch.zeros_like(dq_perturb)
+        identity_q[:, 3] = 1.0
+        q_unnorm = identity_q + dq_perturb
+        delta_q = q_unnorm / q_unnorm.norm(dim=-1, keepdim=True).clamp_min(1e-3)
+        # fov is intrinsic — pass through from the initial-pose input.
         init_fov = initial_pose[:, 7:].float()
-        corrected_t = init_t + dt
-        # Treat dq_perturb as a small quaternion offset; renormalize.
-        q_unnorm = init_q + dq_perturb
-        corrected_q = q_unnorm / q_unnorm.norm(dim=-1, keepdim=True).clamp_min(1e-3)
-        return torch.cat([corrected_t, corrected_q, init_fov], dim=-1)          # (B, 9)
+        return torch.cat([dt, delta_q, init_fov], dim=-1)                        # (B, 9) DELTA pose
 
 
 if __name__ == "__main__":
@@ -136,25 +143,27 @@ if __name__ == "__main__":
     weight = torch.rand(B, P, device="cuda") * 0.5
     init_pose = torch.tensor([[0., 0., 0., 0., 0., 0., 1., 1.0, 1.0]], device="cuda")
 
-    corrected = head(current, rendered, weight, init_pose)
+    delta = head(current, rendered, weight, init_pose)
     print(f"[render-cmp] in: current {tuple(current.shape)}, rendered {tuple(rendered.shape)}, "
           f"weight {tuple(weight.shape)}, init_pose {tuple(init_pose.shape)}")
-    print(f"[render-cmp] out corrected: {tuple(corrected.shape)} = {corrected[0].tolist()}")
-    # At init, correction should be exactly 0 (zero-init final layer).
-    dt_norm = (corrected[:, :3] - init_pose[:, :3]).abs().max().item()
-    dq_norm = (corrected[:, 3:7] - init_pose[:, 3:7]).abs().max().item()
-    print(f"[render-cmp] init correction magnitude: dt_max={dt_norm:.2e}, dq_max={dq_norm:.2e}")
-    assert dt_norm < 1e-6 and dq_norm < 1e-6, "init correction should be ~0 (zero-init final layer)"
+    print(f"[render-cmp] out delta: {tuple(delta.shape)} = {delta[0].tolist()}")
+    # At init (zero-init MLP), delta should be identity: (0,0,0,0,0,0,1, fov).
+    identity_delta = torch.tensor([[0., 0., 0., 0., 0., 0., 1., 1.0, 1.0]], device="cuda")
+    dt_max = (delta[:, :3] - identity_delta[:, :3]).abs().max().item()
+    dq_max = (delta[:, 3:7] - identity_delta[:, 3:7]).abs().max().item()
+    fov_max = (delta[:, 7:] - identity_delta[:, 7:]).abs().max().item()
+    print(f"[render-cmp] init delta magnitude: dt_max={dt_max:.2e}, dq_max={dq_max:.2e}, fov_max={fov_max:.2e}")
+    assert dt_max < 1e-6 and dq_max < 1e-6, "init delta should be identity (zero-init final layer)"
 
-    # Stress test: zero rendered + zero weight → should still produce init pose (no info available).
+    # Stress test: zero rendered + zero weight → coverage=0 → delta must be identity.
     zero_rendered = torch.zeros(B, P, 32, device="cuda")
     zero_weight = torch.zeros(B, P, device="cuda")
-    corrected_zero = head(current, zero_rendered, zero_weight, init_pose)
-    diff_to_init = (corrected_zero - init_pose).abs().max().item()
-    print(f"[render-cmp] zero-grid stress: corrected diff to init = {diff_to_init:.2e} (should be ~0)")
+    delta_zero = head(current, zero_rendered, zero_weight, init_pose)
+    diff_to_id = (delta_zero - identity_delta).abs().max().item()
+    print(f"[render-cmp] zero-grid stress: delta diff to identity = {diff_to_id:.2e} (should be ~0)")
 
     # Backward sanity.
-    loss = (corrected[:, :3] - torch.tensor([0.1, 0.0, 0.0], device="cuda")).pow(2).sum()
+    loss = (delta[:, :3] - torch.tensor([0.1, 0.0, 0.0], device="cuda")).pow(2).sum()
     loss.backward()
     print(f"[render-cmp] backward OK")
     print(f"[render-cmp] params: {sum(p.numel() for p in head.parameters()) / 1e3:.1f}K")

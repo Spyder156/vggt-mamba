@@ -31,13 +31,26 @@ data:
   frame_stride: 10
   randomize_stride: [10, 30]      # carry forward — keeps motion variety
   depth_max_m: 8.0
+  # Explicit sequence selection. Bounds-fit check 2026-05-30:
+  #   sitting_xyz: cam bbox (1.1m) tiny; fits trivially in (-4,-4,-2, 4,4,8).
+  #   fr1/room:    cam bbox (3.4m); cam x∈[-1.16, 1.39], y∈[-1.35, 0.86], z∈[1.19, 1.70].
+  #                Fits inside bounds. Adds real motion + loop closures.
+  # Excluded: fr3/long_office (bbox 7.1m would risk OOB at long window).
+  train_seqs:
+    - rgbd_dataset_freiburg3_sitting_xyz
+    - rgbd_dataset_freiburg1_room
+  # Eval keeps the default (walking_* + sitting_*) — sitting_xyz overlap is
+  # acceptable for the 500-step diagnostic phase.
+  eval_seqs: null
 
 model:
   n_intraframe_layers: 4
-  # 8×8×8 m cube, 64³ voxels = 12.5 cm voxel size. Documented assumption:
-  # camera trajectory must stay within this volume around frame 0 (TUM-Freiburg3
-  # rooms fit comfortably).
-  voxel_bounds: [-4.0, -4.0, -4.0, 4.0, 4.0, 4.0]
+  # Asymmetric z bounds: scene extends in +z direction from the camera (GT-pose
+  # occupancy showed world_z p05/p95 = +1.68/+8.02 m), and the camera barely
+  # moves in z (TUM sitting_xyz GT z range 0.10 m). Symmetric ±4 wastes the
+  # -4..0 slab behind the camera. xy stay ±4 (camera xy motion is small, scene
+  # is in front).
+  voxel_bounds: [-4.0, -4.0, -2.0, 4.0, 4.0, 8.0]
   voxel_resolution: [64, 64, 64]
   voxel_feature_dim: 32
   # Render config
@@ -49,8 +62,13 @@ model:
   bootstrap_max_depth: 10.0
   # Render-and-compare pose head
   pose_head_hidden: 256
-  pose_max_dt: 0.30
-  pose_max_dq: 0.15
+  # Bounds tightened from (0.30, 0.15) → (0.05, 0.03) on 2026-05-31. Old bounds
+  # were 60× larger than GT delta scale (~5mm/frame on sitting_xyz), letting
+  # the optimizer satisfy the per-frame loss with a lazy constant output
+  # (pred-vs-gt correlation = 0). New bounds force outputs into the actual
+  # GT-delta regime so per-frame loss has to learn the input→output mapping.
+  pose_max_dt: 0.05
+  pose_max_dq: 0.03
   # Unwritten-voxel loss-mask threshold
   unwritten_mask_threshold: 0.001
 
@@ -61,6 +79,15 @@ loss:
   w_pose: 1.0
   w_mvc: 0.1
   mvc_samples: 512               # smaller MVC sampling — D's forward is heavier
+  # Tracking-focused pose loss: relative-L1 + masked cosine + small smooth_l1.
+  # Forces the head to track GT delta magnitude + direction instead of
+  # outputting a lazy constant. Cosine masked on frames where |gt_dt| > 2mm
+  # to avoid the still-frame singularity.
+  pose_tracking: true
+  pose_w_l1: 0.1
+  pose_w_rel: 1.0
+  pose_w_cos: 1.0
+  pose_cos_mag_floor_m: 0.002
 
 optim:
   lr: 5.0e-5
@@ -75,6 +102,9 @@ train:
   log_every: 25
   eval_every: 500
   ckpt_every: 1000
+  diag_every: 100              # grid mass + pose delta histogram dump
+  img_every: 500               # image panels (RGB / GT / pred / error / voxel projections / trajectory)
+  tensorboard: true            # SummaryWriter under <out_dir>/tb
   precision: bfloat16
 
-output_dir: experiments/phase4_terrawm_d_seed0
+output_dir: experiments/phase4_terrawm_d_seed0_tracking

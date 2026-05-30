@@ -25,10 +25,18 @@ def _quat_geodesic_loss(pred_q: torch.Tensor, gt_q: torch.Tensor) -> torch.Tenso
 
     Args:
         pred_q, gt_q: (..., 4) — already (or nearly) unit-norm.
+
+    Note: dot is clamped to [0, 1 - 1e-6] to keep acos away from the +1
+    singularity. acos'(1) = -1/sqrt(1-1²) = -inf — and the delta-pose
+    formulation has the model produce EXACTLY identity at frame 0 (zero-init
+    + coverage=0 → identity quat), matched against GT identity delta,
+    yielding dot=1 exactly and infinite backward gradient. Clamping at
+    1-1e-6 means a max forward error of ~0.0014 rad on the matched case
+    and finite backward everywhere.
     """
     pred_q = F.normalize(pred_q, dim=-1)
     gt_q = F.normalize(gt_q, dim=-1)
-    dot = (pred_q * gt_q).sum(dim=-1).abs().clamp(0.0, 1.0)
+    dot = (pred_q * gt_q).sum(dim=-1).abs().clamp(0.0, 1.0 - 1e-6)
     return (2.0 * torch.acos(dot)).mean()
 
 
@@ -59,6 +67,75 @@ def camera_loss(pred_cam: torch.Tensor, gt_cam: torch.Tensor) -> tuple[torch.Ten
     }
 
 
+def camera_tracking_loss(
+    pred_cam: torch.Tensor,
+    gt_cam: torch.Tensor,
+    w_l1: float = 0.1,
+    w_rel: float = 1.0,
+    w_cos: float = 1.0,
+    cos_mag_floor_m: float = 0.002,
+    eps: float = 1e-4,
+) -> tuple[torch.Tensor, dict]:
+    """Tracking-focused pose loss. Designed to break the 'output a constant
+    delta' lazy-solution failure mode that pure per-frame L1 falls into when
+    GT deltas are small.
+
+    Three terms on the delta translation:
+      - smooth_l1 (background, small weight)
+      - relative-L1: |pred - gt|.mean() / (mean GT magnitude in batch).clamp_min(eps).
+        Forces tracking AT the right magnitude — a constant output can't satisfy this
+        when GT magnitude is small but constant output magnitude is large.
+      - masked cosine: (1 - cos(pred, gt)) averaged ONLY on frames where
+        |gt_dt| > cos_mag_floor_m. Penalizes direction mismatch when GT actually
+        has a direction; skipped on still frames (where GT direction is meaningless
+        noise — would produce garbage gradient).
+
+    Rotation: existing geodesic loss. FOV: L1 with small weight.
+    """
+    pred_t = pred_cam[..., :3]
+    gt_t = gt_cam[..., :3]
+    pred_q = pred_cam[..., 3:7]
+    gt_q = gt_cam[..., 3:7]
+    pred_fov = pred_cam[..., 7:]
+    gt_fov = gt_cam[..., 7:]
+
+    # Background term (kept small).
+    trans_huber = F.smooth_l1_loss(pred_t, gt_t)
+
+    # Relative-L1: rescale by per-batch mean GT magnitude.
+    gt_mag = gt_t.norm(dim=-1)                                       # (B, T)
+    scale = gt_mag.mean().clamp_min(eps)                             # scalar
+    rel_l1 = (pred_t - gt_t).abs().mean() / scale
+
+    # Masked cosine direction — only on frames where GT has real motion.
+    pred_norm = pred_t.norm(dim=-1).clamp_min(eps)                   # (B, T)
+    gt_norm = gt_t.norm(dim=-1).clamp_min(eps)                       # (B, T)
+    cos_sim = (pred_t * gt_t).sum(dim=-1) / (pred_norm * gt_norm)    # (B, T) in [-1, 1]
+    cos_mask = (gt_mag > cos_mag_floor_m).float()                    # (B, T)
+    cos_mask_sum = cos_mask.sum().clamp_min(1.0)
+    direction = ((1.0 - cos_sim) * cos_mask).sum() / cos_mask_sum
+
+    rot_geo = _quat_geodesic_loss(pred_q, gt_q)
+    fov_l1 = F.l1_loss(pred_fov, gt_fov)
+
+    total = (w_l1 * trans_huber + w_rel * rel_l1 + w_cos * direction
+             + rot_geo + 0.1 * fov_l1)
+    # Diagnostic: scale ratio + cosine-on-tracked-frames (verdict metrics).
+    with torch.no_grad():
+        scale_ratio = (pred_t.norm(dim=-1).mean() / gt_mag.mean().clamp_min(eps))
+        mean_cos_on_tracked = (cos_sim * cos_mask).sum() / cos_mask_sum
+    return total, {
+        "cam_trans": float(trans_huber.detach()),
+        "cam_rel": float(rel_l1.detach()),
+        "cam_direction": float(direction.detach()),
+        "cam_rot": float(rot_geo.detach()),
+        "cam_fov": float(fov_l1.detach()),
+        "cam_scale_ratio": float(scale_ratio.detach()),
+        "cam_cos_tracked": float(mean_cos_on_tracked.detach()),
+        "cam_track_frac": float(cos_mask.mean().detach()),
+    }
+
+
 def terrawm_d_loss(
     predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -68,6 +145,11 @@ def terrawm_d_loss(
     w_pose: float = 1.0,
     w_mvc: float = 0.1,
     mvc_samples: int = 1024,
+    pose_tracking: bool = False,
+    pose_w_l1: float = 0.1,
+    pose_w_rel: float = 1.0,
+    pose_w_cos: float = 1.0,
+    pose_cos_mag_floor_m: float = 0.002,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """D's loss: bootstrap-depth (write supervision) + rendered-depth (masked
     on unwritten voxels) + delta-pose. No predictor, no VICReg, no anchor.
@@ -119,7 +201,14 @@ def terrawm_d_loss(
 
     # 3. Delta-pose: corrected pose vs GT delta pose (same as TerraWM's delta
     #    supervision). Caller passes camera_delta_gt computed once per batch.
-    cam_t, cam_log = camera_loss(predictions["camera"], targets["camera_delta_gt"])
+    if pose_tracking:
+        cam_t, cam_log = camera_tracking_loss(
+            predictions["camera"], targets["camera_delta_gt"],
+            w_l1=pose_w_l1, w_rel=pose_w_rel, w_cos=pose_w_cos,
+            cos_mag_floor_m=pose_cos_mag_floor_m,
+        )
+    else:
+        cam_t, cam_log = camera_loss(predictions["camera"], targets["camera_delta_gt"])
     log.update(cam_log)
     log["loss_pose"] = float(cam_t.detach())
 

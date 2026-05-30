@@ -170,14 +170,17 @@ class TerraWM_D(nn.Module):
         rendered_feat = render1["feature"]                                  # (B, P, voxel_dim)
         ray_total_w1 = render1["total_weight"]                              # (B, P)
 
-        # Pose head: render-vs-current → corrected pose.
+        # Pose head: render-vs-current → DELTA pose (camera-frame relative motion).
         initial_pose_9 = _pose_T_to_cam9(initial_pose_T, fov_passthrough)   # (B, 9)
-        corrected_pose_9 = self.pose_head(
+        delta_pose_9 = self.pose_head(
             patches, rendered_feat, ray_total_w1, initial_pose_9,
-        )                                                                    # (B, 9)
-        corrected_pose_T = cam9_to_pose_w_c(corrected_pose_9)               # (B, 4, 4) differentiable
+        )                                                                    # (B, 9) DELTA — see render_compare.RenderCompareHead.forward
+        # Compose with the previous absolute pose to get this frame's absolute
+        # pose for write + 2nd render: T_world_t = T_world_{t-1} @ T_delta.
+        delta_pose_T = cam9_to_pose_w_c(delta_pose_9)                       # (B, 4, 4)
+        corrected_pose_T = initial_pose_T.float() @ delta_pose_T            # (B, 4, 4)
 
-        # WRITE: project patches to 3D via (corrected pose, bootstrap depth), scatter.
+        # WRITE: project patches to 3D via (corrected abs pose, bootstrap depth), scatter.
         # Both pose and depth detached so the geometric write doesn't backprop
         # into them — write is a one-way deposit, firewalled.
         with torch.no_grad():
@@ -190,8 +193,11 @@ class TerraWM_D(nn.Module):
         voxel_feat = self.patch_to_voxel(patches)                           # (B, P, voxel_dim)
         write_voxels_trilinear(voxel_state, world_pts, voxel_feat)
 
-        # 2nd render: at corrected pose, for dense depth output.
-        ray_o2, ray_d2 = build_rays_from_pose(corrected_pose_T, K_intrinsics, patch_pixel)
+        # 2nd render: at corrected abs pose, for dense depth output.
+        # POSE FIREWALL: detach so the render loss only updates voxel features
+        # (through voxel_state) and not the pose head. Pose head is supervised
+        # only by Loss_pose — keeps gradient paths isolated and stable.
+        ray_o2, ray_d2 = build_rays_from_pose(corrected_pose_T.detach(), K_intrinsics, patch_pixel)
         render2 = render_rays_volumetric(
             voxel_state, ray_o2, ray_d2,
             n_samples=self.n_render_samples, near=self.render_near, far=self.render_far,
@@ -216,7 +222,8 @@ class TerraWM_D(nn.Module):
             "depth_mask": dense_mask,                                        # (B, H, W) bool: which pixels are write-covered
             "depth_mass": dense_mass,                                        # (B, H, W) per-pixel render weight (for diagnostics)
             "bootstrap_depth_patch": bootstrap_d,                            # (B, P) for Loss_bootstrap
-            "camera": corrected_pose_9,                                      # (B, 9) corrected pose (or delta if interpreted thus)
+            "camera": delta_pose_9,                                          # (B, 9) DELTA pose — directly comparable to camera_delta_gt
+            "corrected_pose_T": corrected_pose_T,                            # (B, 4, 4) absolute pose at this frame (for streaming inference)
             "patch_depth_render": patch_depth,                               # (B, P) per-patch rendered depth (diagnostic)
             "patch_mass_render": patch_mass,                                 # (B, P)
         }
@@ -229,6 +236,7 @@ class TerraWM_D(nn.Module):
         K_intrinsics: torch.Tensor,       # (B, 3, 3)
         gt_poses_w_c: torch.Tensor | None = None,   # (B, T, 4, 4) for teacher-forced initial pose (training)
         fov: torch.Tensor | None = None,            # (B, T, 2)  pass-through fov; defaults to constant
+        return_voxel_state: bool = False,           # if True, add "voxel_write_mass" + "voxel_features" to output
     ) -> dict[str, torch.Tensor]:
         B, T, _, H, W = rgb.shape
         device = rgb.device
@@ -274,7 +282,7 @@ class TerraWM_D(nn.Module):
         pmap = torch.zeros(B, T, 3, H, W, device=device, dtype=depth.dtype)
         pmap[:, :, 2] = depth
 
-        return {
+        out = {
             "pointmap": pmap,                                                # (B, T, 3, H, W) Z=rendered depth
             "depth": depth,
             "depth_mask": mask,                                              # (B, T, H, W) — Loss_render must mask on this
@@ -282,6 +290,9 @@ class TerraWM_D(nn.Module):
             "bootstrap_depth_patch": bootstrap,                              # (B, T, P)
             "camera": cam,                                                   # (B, T, 9) corrected poses
         }
+        if return_voxel_state:
+            out["voxel_write_mass"] = voxel_state.write_mass.detach()        # (B, V_x, V_y, V_z, 1)
+        return out
 
     # ---------- streaming inference ----------
 
@@ -295,16 +306,25 @@ class TerraWM_D(nn.Module):
         self,
         rgb_frame: torch.Tensor,          # (1, 3, H, W) single frame
         voxel_state: VoxelGridState,
-        prev_pose_9: torch.Tensor,        # (1, 9) previous predicted pose
+        prev_pose_9: torch.Tensor,        # (1, 9) ABSOLUTE world-from-camera pose of frame t-1
         K_intrinsics: torch.Tensor,       # (1, 3, 3)
         fov: torch.Tensor | None = None,
     ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        """Streaming inference. Caller passes the previous ABSOLUTE pose; we
+        return the new absolute pose composed from the predicted delta. So
+        existing callers (`prev_pose_9 = corrected`) keep working unchanged —
+        but `out["camera"]` now exposes the predicted delta directly for any
+        diagnostic that wants delta semantics.
+        """
         device = rgb_frame.device
         if fov is None:
             fov = self._default_fov.to(device).unsqueeze(0)
         patches = self._encode_frame(rgb_frame)
         initial_T = cam9_to_pose_w_c(prev_pose_9)
         step_out = self._frame_step(patches, voxel_state, initial_T, K_intrinsics, fov)
+        # Convert the new absolute pose (4x4) back to 9-vec for the caller.
+        new_abs_T = step_out["corrected_pose_T"]                             # (1, 4, 4)
+        new_abs_9 = _pose_T_to_cam9(new_abs_T, fov)                          # (1, 9)
         # Repack to match batched-forward conventions.
         H = W = self.img_size
         pmap = torch.zeros(1, 1, 3, H, W, device=device, dtype=step_out["depth"].dtype)
@@ -313,11 +333,12 @@ class TerraWM_D(nn.Module):
             "pointmap": pmap,
             "depth": step_out["depth"].unsqueeze(1),
             "depth_mask": step_out["depth_mask"].unsqueeze(1),
-            "camera": step_out["camera"].unsqueeze(1),                       # (1, 1, 9)
+            "camera": step_out["camera"].unsqueeze(1),                       # (1, 1, 9) DELTA
+            "camera_abs": new_abs_9.unsqueeze(1),                            # (1, 1, 9) absolute (for trajectory diagnostics)
             "patch_depth_render": step_out["patch_depth_render"],
             "patch_mass_render": step_out["patch_mass_render"],
         }
-        return out, step_out["camera"]                                       # return corrected pose to feed back next frame
+        return out, new_abs_9                                                 # caller feeds this back as prev_pose_9
 
 
 def build_terrawm_d(
