@@ -13,6 +13,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
@@ -66,6 +67,96 @@ def _log_tier4_joint_scatter(tb, step: int, pose_err, coverage, mismatch_rel) ->
     img_t = TF.to_tensor(img)                                                # (C, H, W)
     if hasattr(tb, "writer") and tb.writer is not None:
         tb.writer.add_image("tier4/joint_pose_err_vs_coverage", img_t, step)
+
+
+@torch.no_grad()
+def _eval_held_out_long_horizon(model, seq_name: str, data_root, img_size: int,
+                                  device: str, depth_max_m: float = 8.0) -> dict:
+    """Stream the FULL held-out sequence; compute drift-resistance metrics.
+
+    Per-checkpoint emergence test — measures whether long-horizon behavior
+    improves with scale, not just per-frame quality. The thesis-relevant
+    question is "does drift-resistance emerge with scale" — cam_l1 + abs_rel
+    are per-frame; this is the trajectory-level companion metric.
+
+    Returns dict with:
+      mean_ate_m            mean per-frame Sim3-aligned ATE
+      max_disp_m            worst per-frame displacement
+      survival_frame_1m     last frame index where per-frame disp < 1m
+      survival_frame_2m     last frame index where per-frame disp < 2m
+      disp_at_500_m         per-frame disp at frame 500 (drift profile)
+      disp_at_1000_m        ...
+      disp_at_2000_m        ...
+      n_frames              total frames streamed
+    """
+    from vggt_mamba.data.tum_rgbd import sync_sequence, intrinsics_for
+    from PIL import Image
+    recs = sync_sequence(data_root / seq_name)
+    if len(recs) == 0:
+        return {"n_frames": 0, "error": f"no frames for {seq_name}"}
+    fx, fy, cx, cy = intrinsics_for(seq_name)
+    sx, sy = img_size / 640.0, img_size / 480.0
+    K = torch.tensor([[[fx*sx, 0, cx*sx], [0, fy*sy, cy*sy], [0, 0, 1]]],
+                      device=device)
+    fov = torch.tensor([[1.0, 1.0]], device=device)
+    gt_poses = np.stack([r.pose_w_c for r in recs])
+    P0_inv = np.linalg.inv(gt_poses[0])
+    gt_rel = np.einsum("ij,njk->nik", P0_inv, gt_poses)                     # (T, 4, 4)
+
+    voxel_state = model.init_voxel_state(1, device, torch.float32)
+    prev_pose_9 = torch.tensor([[0., 0, 0, 0, 0, 0, 1, 1.0, 1.0]],
+                                device=device, dtype=torch.float32)
+    displacements = []
+    pred_positions = []
+    for i, rec in enumerate(recs):
+        img = Image.open(rec.rgb_path).convert("RGB").resize((img_size, img_size))
+        rgb = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0
+                                ).permute(2, 0, 1).unsqueeze(0).to(device)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, corrected_9 = model.streaming_forward(
+                rgb, voxel_state, prev_pose_9, K, fov=fov,
+            )
+        pred_pos = corrected_9[0, :3].float().cpu().numpy()
+        gt_pos = gt_rel[i, :3, 3]
+        displacements.append(float(np.linalg.norm(pred_pos - gt_pos)))
+        pred_positions.append(pred_pos)
+        prev_pose_9 = corrected_9.float()
+
+    disp = np.array(displacements)
+    pred_pos_arr = np.stack(pred_positions)
+    gt_pos_arr = gt_rel[:, :3, 3]
+
+    # Sim3-aligned ATE.
+    try:
+        from vggt_mamba.eval.metrics import sim3_align_umeyama
+        s, R, t = sim3_align_umeyama(pred_pos_arr, gt_pos_arr)
+        aligned = s * (pred_pos_arr @ R.T) + t
+        ate_per_frame = np.linalg.norm(aligned - gt_pos_arr, axis=-1)
+        mean_ate_m = float(ate_per_frame.mean())
+    except Exception:
+        mean_ate_m = float(disp.mean())
+
+    # Survival horizon: last frame where per-frame disp < threshold.
+    def survival(thr: float) -> int:
+        below = disp < thr
+        if not below.any():
+            return 0
+        first_above = np.where(~below)[0]
+        return int(first_above[0]) if len(first_above) > 0 else len(disp)
+
+    def disp_at(f: int) -> float:
+        return float(disp[f]) if f < len(disp) else float("nan")
+
+    return {
+        "n_frames": int(len(disp)),
+        "mean_ate_m": mean_ate_m,
+        "max_disp_m": float(disp.max()),
+        "survival_frame_1m": survival(1.0),
+        "survival_frame_2m": survival(2.0),
+        "disp_at_500_m": disp_at(500),
+        "disp_at_1000_m": disp_at(1000),
+        "disp_at_2000_m": disp_at(2000),
+    }
 
 
 def _train_diagnostics(preds: dict, targets: dict, step: int) -> dict:
@@ -595,6 +686,30 @@ def main() -> None:
             }
             torch.save(ckpt, out_dir / f"ckpt_{step:06d}.pt")
             print(f"[d-train] saved ckpt step={step}")
+
+            # === Held-out long-horizon emergence check (per-checkpoint) ===
+            ho_seq = cfg["data"].get("held_out_seq")
+            if ho_seq:
+                model.eval()
+                ho_metrics = _eval_held_out_long_horizon(
+                    model, ho_seq, data_root, img_size, device,
+                    depth_max_m=cfg["data"]["depth_max_m"],
+                )
+                model.train()
+                ho_rec = {"step": step, "kind": "heldout", "seq": ho_seq, **ho_metrics}
+                print(f"[d-heldout] step={step}  seq={ho_seq}  "
+                       f"mean_ate={ho_metrics.get('mean_ate_m', float('nan')):.3f}m  "
+                       f"surv@1m={ho_metrics.get('survival_frame_1m', 0)}/"
+                       f"{ho_metrics.get('n_frames', 0)}  "
+                       f"disp@500={ho_metrics.get('disp_at_500_m', float('nan')):.2f}m  "
+                       f"disp@1000={ho_metrics.get('disp_at_1000_m', float('nan')):.2f}m  "
+                       f"disp@2000={ho_metrics.get('disp_at_2000_m', float('nan')):.2f}m")
+                log_f.write(json.dumps(ho_rec) + "\n"); log_f.flush()
+                if tb is not None:
+                    tb.log_scalars("heldout", {
+                        k: v for k, v in ho_metrics.items()
+                        if isinstance(v, (int, float))
+                    }, step)
 
     log_f.close()
     if tb is not None:
