@@ -37,6 +37,7 @@ from .aggregators.intraframe_attn import IntraFrameTransformer
 from .encoders import DINOv2Encoder, DINOv3Encoder, EncoderOutput, VJEPAEncoder
 from .heads.bootstrap_depth import BootstrapDepthHead
 from .heads.render_compare import RenderCompareHead
+from .heads.write_confidence import WriteConfidenceHead
 from .pose_utils import gt_relative_motion_from_abs_poses, pose_w_c_to_T, T_to_pose_w_c
 from .voxel_grid import (
     VoxelGridConfig,
@@ -79,6 +80,24 @@ class TerraWM_D(nn.Module):
         pose_max_dq: float = 0.15,
         # Unwritten-mask threshold (rays below this total_weight are excluded from dense loss).
         unwritten_mask_threshold: float = 1e-3,
+        # Write-confidence head: makes mass DIFFERENTIABLE via a learned per-patch scalar.
+        # When True, write weights = sigmoid(WriteConfidenceHead(patches)) instead of
+        # constant 1.0. Gives render-loss gradient a path through mass → depth, which
+        # is structurally missing otherwise. See write_confidence.py for the design.
+        use_write_confidence: bool = False,
+        write_confidence_hidden: int = 64,
+        # Pose-head gate mode (no-bypass multiplier on the MLP output). See class
+        # body for the cold-start-vs-drift-freeze distinction.
+        pose_gate_mode: str = "coverage",
+        # Differentiable write geometry: when True, bootstrap_d is NOT detached at the
+        # write step, so render-loss gradient can flow back into bootstrap depth via
+        # the trilinear-write's position dependence (sub-voxel position correction).
+        # Closes the map-adjusts-to-image half of bundle adjustment that the original
+        # detached-write design left open. Position gradient is local (bounded by voxel
+        # size) due to discrete corner-index assignment in write_voxels_trilinear, so
+        # this is the SOFT closed-loop test — sub-voxel correction works, cross-voxel
+        # relocation needs continuous-position representations (e.g. Gaussians).
+        differentiable_write_geometry: bool = False,
     ):
         super().__init__()
         self.encoder = encoder
@@ -111,6 +130,28 @@ class TerraWM_D(nn.Module):
             patch_dim=self.dim, voxel_dim=voxel_feature_dim,
             hidden=pose_head_hidden, max_dt=pose_max_dt, max_dq=pose_max_dq,
         )
+
+        # Optional: write-confidence head (makes mass differentiable).
+        self.use_write_confidence = use_write_confidence
+        if use_write_confidence:
+            self.write_confidence = WriteConfidenceHead(
+                dim=self.dim, hidden=write_confidence_hidden,
+            )
+
+        # Optional: differentiable write geometry. Controls .detach() on bootstrap_d
+        # and the no-grad wrap around the write step.
+        self.differentiable_write_geometry = differentiable_write_geometry
+
+        # Pose-head no-bypass gate mode. The gate multiplies the MLP output to
+        # force delta=identity when "the grid has nothing to say." Two definitions:
+        #   "coverage" (default): use per-render-call ray coverage. Fires on cold
+        #     start (good) BUT also fires when the camera drifts to a region the
+        #     populated grid doesn't cover (bad → self-perpetuating freeze).
+        #   "grid_mass": use a sigmoid on total voxel mass. Only fires when the
+        #     grid is genuinely empty. Doesn't fire on the drift case.
+        # The grid-mass mode is the inference-time fix for the long-horizon
+        # collapse (frame ~900 freeze on fr1/room with pure1 ckpt).
+        self.pose_gate_mode = pose_gate_mode
 
         # Voxel grid config (state is allocated externally).
         self.voxel_cfg = VoxelGridConfig(
@@ -172,8 +213,20 @@ class TerraWM_D(nn.Module):
 
         # Pose head: render-vs-current → DELTA pose (camera-frame relative motion).
         initial_pose_9 = _pose_T_to_cam9(initial_pose_T, fov_passthrough)   # (B, 9)
+        # Compute gate signal. "coverage" → None → render_compare uses its
+        # default coverage-based gate. "grid_mass" → soft sigmoid on total mass:
+        # ≈ 0 when grid is genuinely empty (cold start), ≈ 1 when there's any
+        # meaningful population. Threshold 1e3 puts the sigmoid at half-saturation
+        # around the mass typically seen after a few frames of writes.
+        if self.pose_gate_mode == "grid_mass":
+            mass_total = voxel_state.write_mass.sum().detach()
+            mass_gate = torch.sigmoid((mass_total - 1e3) / 1e2)
+            external_gate = mass_gate.expand(B).unsqueeze(-1).to(initial_pose_9.dtype)
+        else:
+            external_gate = None  # default behavior
         delta_pose_9 = self.pose_head(
             patches, rendered_feat, ray_total_w1, initial_pose_9,
+            external_gate=external_gate,
         )                                                                    # (B, 9) DELTA — see render_compare.RenderCompareHead.forward
         # Compose with the previous absolute pose to get this frame's absolute
         # pose for write + 2nd render: T_world_t = T_world_{t-1} @ T_delta.
@@ -181,17 +234,31 @@ class TerraWM_D(nn.Module):
         corrected_pose_T = initial_pose_T.float() @ delta_pose_T            # (B, 4, 4)
 
         # WRITE: project patches to 3D via (corrected abs pose, bootstrap depth), scatter.
-        # Both pose and depth detached so the geometric write doesn't backprop
-        # into them — write is a one-way deposit, firewalled.
-        with torch.no_grad():
+        # Pose is ALWAYS detached at the write step (firewalls render-loss from pushing
+        # the pose head — separate stability concern). Bootstrap depth is conditionally
+        # detached: when differentiable_write_geometry=True, bootstrap_d keeps its
+        # gradient so render-loss can correct write positions via the trilinear-weight
+        # gradient (sub-voxel position correction). This is the soft closed-loop test
+        # for the map-adjusts-to-image half of bundle adjustment.
+        if self.differentiable_write_geometry:
+            # Keep bootstrap_d's gradient; pose still detached.
             world_pts = backproject_patches_to_world(
-                patch_pixel, bootstrap_d.detach(), K_intrinsics,
+                patch_pixel, bootstrap_d, K_intrinsics,
                 corrected_pose_T.detach(),
-            )                                                                # (B, P, 3)
+            )                                                                # (B, P, 3) — has grad through bootstrap_d
+        else:
+            with torch.no_grad():
+                world_pts = backproject_patches_to_world(
+                    patch_pixel, bootstrap_d.detach(), K_intrinsics,
+                    corrected_pose_T.detach(),
+                )                                                            # (B, P, 3) — fully detached
         # Patch → voxel feature projection IS differentiable (so Loss_render
         # flows back through it into the projection weights and patches).
         voxel_feat = self.patch_to_voxel(patches)                           # (B, P, voxel_dim)
-        write_voxels_trilinear(voxel_state, world_pts, voxel_feat)
+        # Write confidence: scalar [0,1] per patch. Makes mass differentiable
+        # when enabled. None → defaults to constant 1.0 inside write_voxels_trilinear.
+        write_weights = self.write_confidence(patches) if self.use_write_confidence else None
+        write_voxels_trilinear(voxel_state, world_pts, voxel_feat, weights=write_weights)
 
         # 2nd render: at corrected abs pose, for dense depth output.
         # POSE FIREWALL: detach so the render loss only updates voxel features
@@ -357,6 +424,10 @@ def build_terrawm_d(
     pose_max_dt: float = 0.30,
     pose_max_dq: float = 0.15,
     unwritten_mask_threshold: float = 1e-3,
+    use_write_confidence: bool = False,
+    write_confidence_hidden: int = 64,
+    differentiable_write_geometry: bool = False,
+    pose_gate_mode: str = "coverage",
 ) -> TerraWM_D:
     weights_root = Path(weights_root)
     if encoder_name == "dinov3":
@@ -391,6 +462,10 @@ def build_terrawm_d(
         pose_max_dt=pose_max_dt,
         pose_max_dq=pose_max_dq,
         unwritten_mask_threshold=unwritten_mask_threshold,
+        use_write_confidence=use_write_confidence,
+        write_confidence_hidden=write_confidence_hidden,
+        differentiable_write_geometry=differentiable_write_geometry,
+        pose_gate_mode=pose_gate_mode,
     )
 
 

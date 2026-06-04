@@ -72,6 +72,9 @@ def load_model(ckpt_path, weights_root):
         pose_max_dt=cfg["model"]["pose_max_dt"],
         pose_max_dq=cfg["model"]["pose_max_dq"],
         unwritten_mask_threshold=cfg["model"]["unwritten_mask_threshold"],
+        use_write_confidence=cfg["model"].get("use_write_confidence", False),
+        write_confidence_hidden=cfg["model"].get("write_confidence_hidden", 64),
+        differentiable_write_geometry=cfg["model"].get("differentiable_write_geometry", False),
     )
     model.load_state_dict(ckpt["model"], strict=False)
     return model.cuda().eval(), cfg

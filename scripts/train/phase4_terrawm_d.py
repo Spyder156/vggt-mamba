@@ -174,6 +174,9 @@ def main() -> None:
         pose_max_dt=cfg["model"]["pose_max_dt"],
         pose_max_dq=cfg["model"]["pose_max_dq"],
         unwritten_mask_threshold=cfg["model"]["unwritten_mask_threshold"],
+        use_write_confidence=cfg["model"].get("use_write_confidence", False),
+        write_confidence_hidden=cfg["model"].get("write_confidence_hidden", 64),
+        differentiable_write_geometry=cfg["model"].get("differentiable_write_geometry", False),
     ).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[d-train] trainable params: {n_train/1e6:.2f}M  "
@@ -262,6 +265,10 @@ def main() -> None:
                 pose_w_rel=cfg["loss"].get("pose_w_rel", 1.0),
                 pose_w_cos=cfg["loss"].get("pose_w_cos", 1.0),
                 pose_cos_mag_floor_m=cfg["loss"].get("pose_cos_mag_floor_m", 0.002),
+                pose_scale_invariant=cfg["loss"].get("pose_scale_invariant", False),
+                pose_w_scale_inv=cfg["loss"].get("pose_w_scale_inv", 1.0),
+                pose_w_rot=cfg["loss"].get("pose_w_rot", 1.0),
+                pose_w_fov=cfg["loss"].get("pose_w_fov", 0.1),
             )
 
         loss.backward()
@@ -291,6 +298,11 @@ def main() -> None:
                     "cam_scale_ratio": log_dict.get("cam_scale_ratio", 0.0),
                     "cam_cos_tracked": log_dict.get("cam_cos_tracked", 0.0),
                     "cam_track_frac": log_dict.get("cam_track_frac", 0.0),
+                    # Scale-invariant verdict metrics (live):
+                    "cam_scale_inv": log_dict.get("cam_scale_inv", 0.0),
+                    "cam_mag_corr": log_dict.get("cam_mag_corr", 0.0),       # PRIMARY VERDICT
+                    "cam_pred_mag_mean": log_dict.get("cam_pred_mag_mean", 0.0),  # GUARD against collapse
+                    "cam_gt_mag_mean": log_dict.get("cam_gt_mag_mean", 0.0),
                     "depth_mask_coverage": log_dict.get("depth_mask_coverage", 0.0),
                 }, step)
 

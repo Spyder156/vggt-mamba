@@ -75,6 +75,9 @@ def load_model(ckpt_path, weights_root):
         pose_max_dt=cfg["model"]["pose_max_dt"],
         pose_max_dq=cfg["model"]["pose_max_dq"],
         unwritten_mask_threshold=cfg["model"]["unwritten_mask_threshold"],
+        use_write_confidence=cfg["model"].get("use_write_confidence", False),
+        write_confidence_hidden=cfg["model"].get("write_confidence_hidden", 64),
+        differentiable_write_geometry=cfg["model"].get("differentiable_write_geometry", False),
     )
     model.load_state_dict(ckpt["model"], strict=False)
     return model.cuda().eval(), cfg
@@ -262,6 +265,9 @@ def main():
     #   content differs (a specific persistent-features story).  High IoU + flat render-L1
     #   → buffer/redundant writes.
     print(f"\n[d-persist-gt] === VERDICT ===")
+    verdict = "INCONCLUSIVE"
+    spread = slope = 0.0
+    is_monotonic_up = False
     primary_valid = [p for p in primary if not np.isnan(p["render_l1_m"])]
     if len(primary_valid) >= 3:
         R_vals = np.array([p["R"] for p in primary_valid])
@@ -283,12 +289,10 @@ def main():
             verdict = "INCONCLUSIVE"
         print(f"[d-persist-gt]   render-L1 spread: {spread:.4f} m")
         print(f"[d-persist-gt]   render-L1 slope:  {slope:+.5f} m per R-frame")
-        print(f"[d-persist-gt]   monotonic in R:   {is_monotonic}")
+        print(f"[d-persist-gt]   monotonic in R:   {is_monotonic_up}")
         print(f"[d-persist-gt]   VERDICT:          {verdict}")
     else:
         verdict = "INSUFFICIENT_DATA"
-        spread = slope = 0.0
-        is_monotonic = False
         print(f"[d-persist-gt]   too few valid R points to call (need ≥3 with mutual coverage)")
 
     # === Visualizations ===

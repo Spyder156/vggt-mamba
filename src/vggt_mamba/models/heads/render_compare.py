@@ -94,6 +94,7 @@ class RenderCompareHead(nn.Module):
         rendered_feature: torch.Tensor,  # (B, P, voxel_dim) voxel-rendered per-patch features at initial pose
         ray_total_weight: torch.Tensor,  # (B, P) cumulative weight from rendering (0 = ray hit nothing)
         initial_pose: torch.Tensor,      # (B, 9) fov passes through; the rest is unused (delta is camera-frame)
+        external_gate: torch.Tensor | None = None,  # (B, 1) override for the no-bypass multiplier
     ) -> torch.Tensor:
         """Returns (B, 9) DELTA pose: per-frame relative motion in the
         previous-frame's camera coordinates. fov is passed through unchanged.
@@ -115,12 +116,17 @@ class RenderCompareHead(nn.Module):
         coverage = (ray_total_weight > 1e-3).float().mean(dim=1, keepdim=True)  # (B, 1)
         mlp_in = torch.cat([pooled_diff, pooled_cur, coverage], dim=-1)         # (B, 2*voxel_dim+1)
         delta_raw = self.compare(mlp_in)                                         # (B, 7)
-        # STRUCTURAL NO-BYPASS GATE: multiply raw delta by coverage so that
-        # when no rays hit any written voxels (coverage = 0), the correction
-        # is FORCED to zero regardless of MLP biases. This is the hard
-        # guarantee that closes the bypass route through LayerNorm/Linear
-        # biases that produce non-zero output even on zero input.
-        delta_raw = delta_raw * coverage                                         # (B, 7)
+        # STRUCTURAL NO-BYPASS GATE: multiply raw delta by a [0,1] scalar.
+        # Default = per-call render coverage (original behavior, suited to
+        # cold-start protection). But this conflates "grid is empty" (cold
+        # start) with "camera is pointing at unwritten region of a populated
+        # grid" (long-horizon drift). The latter triggers a self-perpetuating
+        # freeze: coverage=0 → delta=identity → camera doesn't move → render
+        # stays empty. external_gate allows the caller to substitute a
+        # grid-mass-based signal (1 if grid is meaningfully populated, 0 if
+        # truly empty) that doesn't fire on the drift case.
+        gate = external_gate if external_gate is not None else coverage
+        delta_raw = delta_raw * gate                                              # (B, 7)
         dt = torch.tanh(delta_raw[:, :3]) * self.max_dt                         # (B, 3) bounded camera-frame delta translation
         dq_perturb = torch.tanh(delta_raw[:, 3:7]) * self.max_dq                # (B, 4) small-angle quat perturbation
         # Delta quaternion: identity baseline (0,0,0,1) + small perturbation, renormalized.

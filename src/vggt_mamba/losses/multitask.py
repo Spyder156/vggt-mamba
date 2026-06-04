@@ -136,6 +136,98 @@ def camera_tracking_loss(
     }
 
 
+def camera_scale_invariant_loss(
+    pred_cam: torch.Tensor,
+    gt_cam: torch.Tensor,
+    w_scale_inv: float = 1.0,
+    w_cos: float = 1.0,
+    w_rot: float = 1.0,
+    w_fov: float = 0.1,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, dict]:
+    """Scale-invariant pose loss. Designed to break the 'output constant
+    magnitude' failure mode that bounded-output + metric-supervision falls into
+    when GT magnitudes vary across frames.
+
+    Three terms on the delta translation:
+      - **scale-invariant log-variance** (Eigen-style): penalize variance of
+        log(|pred| / |gt|) across the batch. A model that outputs pred = k * gt
+        for ANY constant k gets zero loss (loss is invariant to a global
+        multiplicative scale on pred). A model that outputs constant pred
+        regardless of GT magnitude has nonzero variance → nonzero loss. A
+        collapsed pred → 0 model (the lazy escape under naive align-by-regression
+        losses) also gets nonzero loss because log(eps) - log(gt) still varies
+        with gt. The architecture's metric anchors (grid bounds + bootstrap
+        depth supervision) implicitly pull the chosen scale toward GT.
+      - **cosine direction** (already scale-free): no metric mask — cosine on
+        near-zero gt vectors is noisy but bounded, doesn't bias the loss.
+      - **rotation geodesic** (already scale-free): unchanged.
+
+    The diagnostic `cam_mag_corr` is the PRIMARY verdict metric: Pearson
+    correlation between per-frame |pred| and |gt|. Magnitude tracking will
+    register here even if absolute scale doesn't match.
+
+    The diagnostic `cam_pred_mag_mean` is the GUARD against collapse: if it
+    shrinks toward zero, the loss is being gamed — fail it even if
+    cam_scale_inv is small.
+    """
+    pred_t = pred_cam[..., :3]
+    gt_t = gt_cam[..., :3]
+    pred_q = pred_cam[..., 3:7]
+    gt_q = gt_cam[..., 3:7]
+    pred_fov = pred_cam[..., 7:]
+    gt_fov = gt_cam[..., 7:]
+
+    # Scale-invariant magnitude loss (Eigen log-variance).
+    pred_mag = pred_t.norm(dim=-1).clamp_min(eps)                    # (B, T)
+    gt_mag = gt_t.norm(dim=-1).clamp_min(eps)                        # (B, T)
+    log_ratio = pred_mag.log() - gt_mag.log()                        # (B, T)
+    # Center by per-batch mean to absorb any constant multiplicative scale.
+    log_ratio_centered = log_ratio - log_ratio.mean()
+    scale_inv = (log_ratio_centered ** 2).mean()
+
+    # Cosine direction (no metric mask; eps in norm prevents divide-by-zero).
+    cos_sim = (pred_t * gt_t).sum(dim=-1) / (pred_mag * gt_mag)      # (B, T) in [-1, 1]
+    direction = (1.0 - cos_sim).mean()
+
+    # Rotation: geodesic distance (already scale-free).
+    rot_geo = _quat_geodesic_loss(pred_q, gt_q)
+
+    # FOV (intrinsic — keep metric, light weight).
+    fov_l1 = F.l1_loss(pred_fov, gt_fov)
+
+    total = (w_scale_inv * scale_inv + w_cos * direction
+             + w_rot * rot_geo + w_fov * fov_l1)
+
+    # Diagnostics for live monitoring + post-hoc verdict.
+    with torch.no_grad():
+        pred_mag_mean = pred_mag.mean()
+        gt_mag_mean = gt_mag.mean()
+        scale_ratio = pred_mag_mean / gt_mag_mean.clamp_min(eps)
+        # PRIMARY VERDICT: per-frame magnitude correlation. Tracks whether the
+        # model's steps vary WITH gt's steps (the eyes-on-TB observation:
+        # does step size match per-frame, or is it constant?).
+        pm_flat = pred_mag.flatten()
+        gm_flat = gt_mag.flatten()
+        if pm_flat.std() > eps and gm_flat.std() > eps:
+            stacked = torch.stack([pm_flat, gm_flat])
+            mag_corr = torch.corrcoef(stacked)[0, 1]
+        else:
+            mag_corr = torch.tensor(float("nan"), device=pred_t.device)
+
+    return total, {
+        "cam_trans": float(scale_inv.detach()),       # for TB backward compat
+        "cam_scale_inv": float(scale_inv.detach()),
+        "cam_direction": float(direction.detach()),
+        "cam_rot": float(rot_geo.detach()),
+        "cam_fov": float(fov_l1.detach()),
+        "cam_pred_mag_mean": float(pred_mag_mean.detach()),
+        "cam_gt_mag_mean": float(gt_mag_mean.detach()),
+        "cam_scale_ratio": float(scale_ratio.detach()),
+        "cam_mag_corr": float(mag_corr.detach()),     # PRIMARY VERDICT METRIC
+    }
+
+
 def terrawm_d_loss(
     predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -150,6 +242,10 @@ def terrawm_d_loss(
     pose_w_rel: float = 1.0,
     pose_w_cos: float = 1.0,
     pose_cos_mag_floor_m: float = 0.002,
+    pose_scale_invariant: bool = False,
+    pose_w_scale_inv: float = 1.0,
+    pose_w_rot: float = 1.0,
+    pose_w_fov: float = 0.1,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """D's loss: bootstrap-depth (write supervision) + rendered-depth (masked
     on unwritten voxels) + delta-pose. No predictor, no VICReg, no anchor.
@@ -199,9 +295,19 @@ def terrawm_d_loss(
     )
     log["loss_bootstrap"] = float(bs.detach())
 
-    # 3. Delta-pose: corrected pose vs GT delta pose (same as TerraWM's delta
-    #    supervision). Caller passes camera_delta_gt computed once per batch.
-    if pose_tracking:
+    # 3. Delta-pose: corrected pose vs GT delta pose. Three modes:
+    #    - pose_scale_invariant: Eigen log-variance + cosine + geodesic (NEW).
+    #      Removes the absolute-scale supervision; the grid + bootstrap depth
+    #      losses are the implicit scale anchors. PRIMARY verdict = cam_mag_corr.
+    #    - pose_tracking: relative-L1 + masked cosine + smooth_l1 (older).
+    #    - default: smooth_l1 + geodesic + fov.
+    if pose_scale_invariant:
+        cam_t, cam_log = camera_scale_invariant_loss(
+            predictions["camera"], targets["camera_delta_gt"],
+            w_scale_inv=pose_w_scale_inv, w_cos=pose_w_cos,
+            w_rot=pose_w_rot, w_fov=pose_w_fov,
+        )
+    elif pose_tracking:
         cam_t, cam_log = camera_tracking_loss(
             predictions["camera"], targets["camera_delta_gt"],
             w_l1=pose_w_l1, w_rel=pose_w_rel, w_cos=pose_w_cos,
