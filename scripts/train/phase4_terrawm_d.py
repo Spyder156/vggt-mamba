@@ -27,6 +27,47 @@ from vggt_mamba.models.pose_utils import gt_relative_motion_from_abs_poses      
 from vggt_mamba.models.terrawm_d import build_terrawm_d                            # noqa: E402
 
 
+def _log_tier4_joint_scatter(tb, step: int, pose_err, coverage, mismatch_rel) -> None:
+    """Joint pose_err vs coverage scatter, colored by mismatch_rel.
+
+    Training-time analogue of the streaming displacement-vs-coverage scatter
+    from terrawm_d_drift_blind_check.py. The diagnostic insight is the JOINT
+    structure: high pose error AT high coverage is the drift-blind regime.
+    If the high-coverage / high-err quadrant has uniform mismatch_rel color,
+    that's the in-training fingerprint of the drift-blindness the streaming
+    check measured.
+    """
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import numpy as np
+    import torchvision.transforms.functional as TF
+
+    fig, ax = plt.subplots(figsize=(7.5, 6))
+    sc = ax.scatter(pose_err, coverage, c=mismatch_rel, cmap="plasma",
+                     s=18, alpha=0.7, edgecolors="none")
+    plt.colorbar(sc, ax=ax, label="mismatch_rel")
+    ax.axhline(0.9, color="orange", linestyle="--", alpha=0.4, label="cov > 0.9")
+    if pose_err.size > 0 and pose_err.max() > 0:
+        ax.axvline(float(np.median(pose_err)), color="red", linestyle="--",
+                    alpha=0.4, label="median pose_err")
+    ax.set_xlabel("pose error per frame (||pred_dt - gt_dt||)")
+    ax.set_ylabel("render coverage")
+    ax.set_title(f"step {step} — joint pose_err vs coverage (colored by mismatch_rel)")
+    ax.grid(alpha=0.3)
+    ax.legend(loc="lower right")
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png", dpi=90, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    img = Image.open(buf).convert("RGB")
+    img_t = TF.to_tensor(img)                                                # (C, H, W)
+    if hasattr(tb, "writer") and tb.writer is not None:
+        tb.writer.add_image("tier4/joint_pose_err_vs_coverage", img_t, step)
+
+
 def _train_diagnostics(preds: dict, targets: dict, step: int) -> dict:
     """Per-step training diagnostics that adjudicate cold-start vs bias-integration.
 
@@ -105,6 +146,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--config", type=Path, required=True)
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--data-root", type=Path, default=None)
+    # Warm-start: load model weights from a prior ckpt before training. Uses
+    # strict=False so new heads (e.g. ColorHead in the photometric retrain) are
+    # randomly initialized while shared weights are inherited. Optimizer state
+    # is NOT restored (fresh AdamW) — we want the new gradient direction to
+    # adapt freely, not be locked to prior moment estimates.
+    p.add_argument("--warm-from", type=Path, default=None,
+                    help="Prior ckpt to warm-start model weights from (strict=False).")
     return p.parse_args()
 
 
@@ -177,10 +225,26 @@ def main() -> None:
         use_write_confidence=cfg["model"].get("use_write_confidence", False),
         write_confidence_hidden=cfg["model"].get("write_confidence_hidden", 64),
         differentiable_write_geometry=cfg["model"].get("differentiable_write_geometry", False),
+        use_photometric=cfg["model"].get("use_photometric", False),
+        photometric_hidden=cfg["model"].get("photometric_hidden", 64),
+        photometric_pose_gradient=cfg["model"].get("photometric_pose_gradient", False),
     ).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[d-train] trainable params: {n_train/1e6:.2f}M  "
           f"voxel grid: {model.voxel_cfg.resolution} × {model.voxel_cfg.feature_dim}-dim")
+
+    if args.warm_from is not None:
+        prior = torch.load(args.warm_from, map_location="cpu", weights_only=False)
+        missing, unexpected = model.load_state_dict(prior["model"], strict=False)
+        n_loaded = len(prior["model"]) - len(unexpected)
+        print(f"[d-train] warm-start from {args.warm_from} (step {prior.get('step', '?')})")
+        print(f"[d-train]   loaded {n_loaded} keys; {len(missing)} missing (fresh init), "
+               f"{len(unexpected)} unexpected (dropped)")
+        if missing:
+            # Show first few missing keys so the user can verify only NEW heads
+            # are randomly initialized (e.g. color_head.* for photometric retrain).
+            sample = list(missing)[:8]
+            print(f"[d-train]   missing examples: {sample}")
 
     params = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=cfg["optim"]["lr"],
@@ -237,13 +301,17 @@ def main() -> None:
         # detached tensor reference, no extra compute).
         diag_every = cfg["train"].get("diag_every", 100)
         img_every = cfg["train"].get("img_every", 500)
+        # Tier-4 TB diagnostics ride on the same cadence (negligible cost).
+        tier4_every = cfg["train"].get("tier4_every", 50)
         next_step = step + 1
         want_voxel_state = next_step % diag_every == 0 or step == 0 or next_step % img_every == 0
+        want_tier4 = next_step % tier4_every == 0 or step == 0 or want_voxel_state
 
         opt.zero_grad(set_to_none=True)
         with autocast:
             preds = model(rgb, K_intrinsics=K, gt_poses_w_c=poses, fov=fov,
-                          return_voxel_state=want_voxel_state)
+                          return_voxel_state=want_voxel_state,
+                          return_diagnostics=want_tier4)
             targets = {
                 "gt_depth_full": depth,
                 "valid": valid,
@@ -251,6 +319,7 @@ def main() -> None:
                 "gt_depth_patch_valid": patch_v,
                 "poses_w_c": poses,
                 "camera_delta_gt": camera_delta_gt,
+                "rgb_target": rgb,                       # (B, T, 3, H, W) — photometric loss target
             }
             loss, log_dict = terrawm_d_loss(
                 preds, targets,
@@ -269,6 +338,7 @@ def main() -> None:
                 pose_w_scale_inv=cfg["loss"].get("pose_w_scale_inv", 1.0),
                 pose_w_rot=cfg["loss"].get("pose_w_rot", 1.0),
                 pose_w_fov=cfg["loss"].get("pose_w_fov", 0.1),
+                w_photometric=cfg["loss"].get("w_photometric", 0.0),
             )
 
         loss.backward()
@@ -279,10 +349,11 @@ def main() -> None:
         if step % cfg["train"]["log_every"] == 0 or step == 1:
             elapsed = time.perf_counter() - t_start
             rec = {"step": step, "lr": lr_at(step), "elapsed_s": elapsed, **log_dict}
+            photo_str = f"  photo={log_dict['loss_photometric']:.4f}" if "loss_photometric" in log_dict else ""
             print(f"[d-train] step={step:5d}  lr={rec['lr']:.2e}  "
                   f"render_l1={log_dict['loss_render_l1']:.4f}  "
                   f"bootstrap={log_dict['loss_bootstrap']:.4f}  "
-                  f"pose={log_dict['loss_pose']:.4f}  "
+                  f"pose={log_dict['loss_pose']:.4f}{photo_str}  "
                   f"mask_cov={log_dict['depth_mask_coverage']:.2f}  "
                   f"total={log_dict['loss_total']:.4f}")
             log_f.write(json.dumps(rec) + "\n")
@@ -339,6 +410,104 @@ def main() -> None:
                     nz = wm[wm > 0]
                     if nz.numel() > 0:
                         tb.log_histograms("hist", {"voxel_mass_nonzero": nz}, step)
+
+        # === Tier-4 TB dashboard (causal-chain panels) ===
+        # The mismatch panels are the most important — they directly track the
+        # drift-blindness hypothesis. dt_corr_with_mismatch is the action-on-signal
+        # check: does the head respond to the signal it reads?
+        if want_tier4 and "diagnostics" in preds and tb is not None:
+            diag = preds["diagnostics"]                                          # each (B, T)
+            # Per-frame pose error (training-time analogue of streaming displacement).
+            with torch.no_grad():
+                pred_t = preds["camera"][..., :3].detach().float()              # (B, T, 3)
+                gt_t = targets["camera_delta_gt"][..., :3].detach().float()
+                pose_err_per_frame = (pred_t - gt_t).norm(dim=-1)                # (B, T)
+            # Flatten (B, T) → (N,) for scalar means and the correlation.
+            flat = {k: v.detach().float().flatten() for k, v in diag.items()}
+            pose_err_flat = pose_err_per_frame.flatten()
+            # dt_corr_with_mismatch: Pearson(dt_mag, mismatch_l2) across (B*T) frames.
+            # > 0 → head's action magnitude tracks signal magnitude (responsive).
+            # ≈ 0 → head ignores signal. < 0 → head moves OPPOSITE the signal.
+            def _pearson(a: torch.Tensor, b: torch.Tensor) -> float:
+                if a.std() < 1e-6 or b.std() < 1e-6:
+                    return float("nan")
+                return float(torch.corrcoef(torch.stack([a, b]))[0, 1])
+
+            dt_corr_mm_l2 = _pearson(flat["dt_mag"], flat["mismatch_l2"])
+            dt_corr_mm_rel = _pearson(flat["dt_mag"], flat["mismatch_rel"])
+            # Drift-vs-signal correlation: does pose error track mismatch_rel? Negative
+            # → drift-blind (consistent with the standalone check's β_disp < 0).
+            err_corr_mm_rel = _pearson(pose_err_flat, flat["mismatch_rel"])
+            err_corr_coverage = _pearson(pose_err_flat, flat["render_coverage"])
+            # === Photometric — the LIVE CURE MONITOR ===
+            # Pre-registered: with photometric loss on, err_corr_with_photo_mismatch_rel
+            # must cross from negative → positive within 2000 steps. That's the signature
+            # of the inversion being cured. If it stays negative after photometric trains,
+            # photometric did NOT fix the inversion and re-grounding cannot be built on it.
+            photo_present = "photo_mismatch_rel" in flat and float(flat["photo_mismatch_rel"].sum()) > 0
+            if photo_present:
+                err_corr_photo_mm_rel = _pearson(pose_err_flat, flat["photo_mismatch_rel"])
+                dt_corr_photo_mm_rel = _pearson(flat["dt_mag"], flat["photo_mismatch_rel"])
+            else:
+                err_corr_photo_mm_rel = float("nan")
+                dt_corr_photo_mm_rel = float("nan")
+
+            tier4_scalars = {
+                # Tier 1 — Input
+                "enc_current_proj_norm": float(flat["enc_norm"].mean()),
+                # Tier 2 — Memory
+                "grid_mass_total": float(flat["grid_mass_total"].mean()),
+                "write_conf_mean": float(flat["write_conf_mean"].mean()),
+                # Tier 3 — Render channel
+                "render_coverage": float(flat["render_coverage"].mean()),
+                "render_feat_norm": float(flat["render_feat_norm"].mean()),
+                "render_depth_std": float(flat["render_depth_std"].mean()),
+                "bootstrap_d_std": float(flat["bootstrap_d_std"].mean()),
+                # Tier 4 — Pose-head signal + action
+                "pose_mismatch_l2_mean": float(flat["mismatch_l2"].mean()),
+                "pose_mismatch_rel_mean": float(flat["mismatch_rel"].mean()),
+                "pose_pooled_cur_norm_mean": float(flat["pooled_cur_norm"].mean()),
+                "pose_dt_mag_mean": float(flat["dt_mag"].mean()),
+                "pose_gate_value_mean": float(flat["gate_value"].mean()),
+                "pose_dt_corr_with_mismatch_l2": dt_corr_mm_l2,
+                "pose_dt_corr_with_mismatch_rel": dt_corr_mm_rel,
+                # Tier 5 — Outcome (training-time): pose error vs signals
+                "pose_err_per_frame_mean": float(pose_err_flat.mean()),
+                "pose_err_corr_with_mismatch_rel": err_corr_mm_rel,
+                "pose_err_corr_with_coverage": err_corr_coverage,
+                # Photometric — the inversion fix + live cure monitor
+                "pose_photo_mismatch_rel_mean": float(flat["photo_mismatch_rel"].mean()) if photo_present else 0.0,
+                "pose_photo_mismatch_l2_mean": float(flat["photo_mismatch_l2"].mean()) if photo_present else 0.0,
+                "pose_err_corr_with_photo_mismatch_rel": err_corr_photo_mm_rel,
+                "pose_dt_corr_with_photo_mismatch_rel": dt_corr_photo_mm_rel,
+            }
+            tb.log_scalars("tier4", tier4_scalars, step)
+
+            # Histograms — distributional complements to the scalar means.
+            tier4_hists = {
+                "mismatch_rel": flat["mismatch_rel"],
+                "mismatch_l2": flat["mismatch_l2"],
+                "dt_mag": flat["dt_mag"],
+                "render_coverage": flat["render_coverage"],
+                "pose_err_per_frame": pose_err_flat,
+            }
+            if photo_present:
+                tier4_hists["photo_mismatch_rel"] = flat["photo_mismatch_rel"]
+            tb.log_histograms("tier4_hist", tier4_hists, step)
+            if (preds["diagnostics"]["write_conf_mean"] > 0).any():
+                tb.log_histograms("tier4_hist", {
+                    "write_conf_mean": flat["write_conf_mean"],
+                }, step)
+
+            # Joint displacement-vs-coverage scatter — the drift-blindness diagnostic
+            # image. Logged at img_every cadence (heavy → don't do every step).
+            if next_step % img_every == 0 or step == 0:
+                _log_tier4_joint_scatter(
+                    tb=tb, step=step,
+                    pose_err=pose_err_flat.cpu().numpy(),
+                    coverage=flat["render_coverage"].cpu().numpy(),
+                    mismatch_rel=flat["mismatch_rel"].cpu().numpy(),
+                )
 
         if want_voxel_state and (next_step % img_every == 0 or step == 0):
             if tb is not None:

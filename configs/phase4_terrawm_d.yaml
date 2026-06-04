@@ -102,6 +102,20 @@ model:
   # voxels structurally can't host the closed loop (discrete corner indexes block
   # cross-voxel relocation), same Gaussian commit but stronger justification.
   differentiable_write_geometry: true
+  # Photometric — fix for the geometric-channel inversion (β_disp_geom = -2.18,
+  # 95% CI [-2.99, -1.38] after controlling for coverage; see
+  # viz/output/terrawm_d_drift_blind_check/summary.json). ColorHead on rendered
+  # voxel features → per-patch + dense RGB prediction. Bypass-guarded (reads
+  # only rendered features). Pre-registered gate: β_disp_photo ≥ +1.0 after
+  # retrain (rerun drift_blind_check with photometric mismatch).
+  use_photometric: false           # flip to true when launching the photometric retrain
+  photometric_hidden: 64
+  # Photometric pose-gradient: when true, the 2nd render's pose is NOT detached
+  # → photometric loss flows back into the pose head. This is the point of
+  # photometric in the inversion regime: replace the bad geometric pose signal
+  # with a good photometric one. Co-guarded by scene-state ablation
+  # (post-reset Δt ≥ 0.10m).
+  photometric_pose_gradient: false  # flip to true when use_photometric=true
 
 loss:
   w_render_l1: 1.0
@@ -126,6 +140,9 @@ loss:
   pose_w_fov: 0.1
   # Disable tracking loss (the old path).
   pose_tracking: false
+  # Photometric loss weight. 0 = disabled. Start at 1.0 for the photometric
+  # retrain (matched order of magnitude to w_render_l1).
+  w_photometric: 0.0
 
 optim:
   lr: 5.0e-5

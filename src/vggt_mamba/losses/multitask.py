@@ -228,6 +228,29 @@ def camera_scale_invariant_loss(
     }
 
 
+def photometric_l1(
+    rgb_pred: torch.Tensor,            # (B, T, 3, H, W) ∈ [0, 1]
+    rgb_target: torch.Tensor,          # (B, T, 3, H, W) ∈ [0, 1]
+    depth_mask: torch.Tensor,          # (B, T, H, W) bool — only score where grid covers
+) -> torch.Tensor:
+    """L1 photometric loss, masked on depth_mask.
+
+    The drift-blind check (terrawm_d_drift_blind_check.py) confirmed the
+    geometric render-vs-current channel INVERTS with drift (β_disp = -2.18).
+    Photometric is the candidate fix: predict per-patch RGB from rendered
+    voxel features and supervise against current frame's RGB.
+
+    Mask is on depth_mask (where the grid has content). Unwritten regions
+    render to ~0 features → trivially predict gray → would dominate the
+    loss without masking and let the color head game it without engaging
+    the grid.
+    """
+    diff = (rgb_pred - rgb_target).abs()                                     # (B, T, 3, H, W)
+    mask = depth_mask.unsqueeze(2).float()                                   # (B, T, 1, H, W)
+    masked = (diff * mask).sum()
+    return masked / (mask.sum() * 3.0).clamp_min(1.0)
+
+
 def terrawm_d_loss(
     predictions: dict[str, torch.Tensor],
     targets: dict[str, torch.Tensor],
@@ -246,6 +269,7 @@ def terrawm_d_loss(
     pose_w_scale_inv: float = 1.0,
     pose_w_rot: float = 1.0,
     pose_w_fov: float = 0.1,
+    w_photometric: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """D's loss: bootstrap-depth (write supervision) + rendered-depth (masked
     on unwritten voxels) + delta-pose. No predictor, no VICReg, no anchor.
@@ -324,8 +348,19 @@ def terrawm_d_loss(
     )
     log["loss_mvc"] = float(mvc.detach())
 
+    # 5. Photometric — fix for the geometric-channel inversion (β_disp_geom = -2.18).
+    #    L1 between predicted RGB (from ColorHead on rendered voxel features) and the
+    #    current frame's RGB, masked on depth_mask. Required: predictions["rgb_pred"]
+    #    AND targets["rgb_target"]. w_photometric=0 disables; > 0 activates.
+    photo = depth.new_zeros(())
+    if w_photometric > 0 and "rgb_pred" in predictions and "rgb_target" in targets:
+        photo = photometric_l1(
+            predictions["rgb_pred"].float(), targets["rgb_target"].float(), depth_mask,
+        )
+        log["loss_photometric"] = float(photo.detach())
+
     total = (w_render_l1 * render_l1 + w_render_log * render_log +
-             w_bootstrap * bs + w_pose * cam_t + w_mvc * mvc)
+             w_bootstrap * bs + w_pose * cam_t + w_mvc * mvc + w_photometric * photo)
     log["loss_total"] = float(total.detach())
     return total, log
 
