@@ -134,13 +134,14 @@ def main():
     for i, rec in enumerate(recs):
         rgb = load_rgb(rec, img_size).cuda(non_blocking=True)
         gt_T = gt_rel_T[i:i+1]                                                  # (1, 4, 4)
-        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-            patches = model._encode_frame(rgb)
-            bootstrap_d = model.bootstrap_depth(patches).float()
-            voxel_feat = model.patch_to_voxel(patches).float()
-            wc = model.write_confidence(patches).float() if model.use_write_confidence else None
-            wp = backproject_patches_to_world(patch_pixel, bootstrap_d, K, gt_T)
-            write_voxels_trilinear(voxel_state, wp, voxel_feat, weights=wc)
+        with torch.no_grad():
+            with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+                patches = model._encode_frame(rgb)
+                bootstrap_d = model.bootstrap_depth(patches).float()
+                voxel_feat = model.patch_to_voxel(patches).float()
+                wc = model.write_confidence(patches).float() if model.use_write_confidence else None
+                wp = backproject_patches_to_world(patch_pixel, bootstrap_d, K, gt_T)
+                write_voxels_trilinear(voxel_state, wp, voxel_feat, weights=wc)
         if i in fire_frame_set:
             snapshots[i] = snapshot_voxel_state(voxel_state)
         if (i + 1) % 200 == 0:
