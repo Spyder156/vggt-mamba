@@ -223,21 +223,37 @@ def build_rays_from_pose(
     K: torch.Tensor,               # (B, 3, 3) intrinsics
     pixel_xy: torch.Tensor,        # (B, R, 2) per-ray pixel centers (u, v)
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build world-frame ray origins and unit directions from camera pose + intrinsics.
+    """Build world-frame ray origins and UNNORMALIZED directions, using the
+    along-z depth convention (matches backproject_patches_to_world + bootstrap_d).
 
     Origin = camera center = pose_w_c[:3, 3] (broadcast over R rays).
-    Direction = pose_w_c.rotation @ K^-1 @ [u, v, 1], normalized.
+    Direction = pose_w_c.rotation @ K^-1 @ [u, v, 1], NOT normalized.
+
+    K^-1 @ [u, v, 1] has z=1 in camera frame, so a sample point
+        origin + t · dir
+    has camera-frame z = t. That is: t = depth-along-z, the same convention
+    bootstrap_d / TUM GT depth / backproject_patches_to_world use. The
+    along-z norm of dir_world equals ||cam_dir||_2, which is >= 1 and grows
+    radially outward from the principal point. The renderer must scale the
+    density-vs-dt math by ||dir|| to integrate against the physical ray
+    length, but `t` itself is z-distance everywhere.
+
+    Previously dir_world was normalized, which made `origin + t · dir` give
+    along-ray distance instead of along-z. That was inconsistent with the
+    write path (backproject treats depth as z) and bootstrap_d (trained
+    against TUM GT depth, which is z). Confirmed by terrawm_d_convention_check
+    09 + 10: 25-30cm discrepancy at corners at depth=1.5m, growing radially.
     """
     B, R, _ = pixel_xy.shape
     K_inv = torch.linalg.inv(K.float())                                 # (B, 3, 3)
     ones = torch.ones(B, R, 1, device=pixel_xy.device, dtype=pixel_xy.dtype)
     pix_h = torch.cat([pixel_xy.float(), ones.float()], dim=-1)         # (B, R, 3)
-    # Ray dir in camera frame.
+    # Ray dir in camera frame: (K^-1 @ [u, v, 1]), unnormalized → z = 1.
     dir_cam = torch.einsum("bij,brj->bri", K_inv, pix_h)                 # (B, R, 3)
-    # Rotate to world.
+    # Rotate to world. NOT normalized — keep ||dir|| = ||cam_dir|| so the
+    # renderer's z-convention math is consistent with backproject's.
     R_wc = pose_w_c[:, :3, :3].float()
     dir_world = torch.einsum("bij,brj->bri", R_wc, dir_cam)             # (B, R, 3)
-    dir_world = dir_world / dir_world.norm(dim=-1, keepdim=True).clamp_min(1e-12)
     t_wc = pose_w_c[:, :3, 3].float()                                   # (B, 3)
     origin = t_wc.unsqueeze(1).expand(B, R, 3)                          # (B, R, 3)
     return origin, dir_world
@@ -265,52 +281,63 @@ def backproject_patches_to_world(
 def render_rays_volumetric(
     state: VoxelGridState,
     ray_origins: torch.Tensor,     # (B, R, 3)  per-ray origin (world frame)
-    ray_dirs: torch.Tensor,        # (B, R, 3)  per-ray direction (unit vector)
+    ray_dirs: torch.Tensor,        # (B, R, 3)  per-ray direction (UNNORMALIZED, z-convention)
     n_samples: int = 64,
     near: float = 0.1,
     far: float = 8.0,
 ) -> dict[str, torch.Tensor]:
-    """Volumetric rendering of rays through the voxel grid.
+    """Volumetric rendering using the along-z depth convention.
 
-    For each ray: sample N points at evenly-spaced depths in [near, far];
-    look up voxel features + write_mass at each sample; use mass as density
-    proxy; accumulate via standard NeRF-style alpha compositing.
+    ray_dirs is the world-frame ray direction with camera-frame z=1 (i.e.
+    NOT unit-normalized). With this convention, sample positions
+        pt_i = origin + t_i · ray_dir
+    have camera-frame z = t_i, so t directly represents along-z depth — the
+    same units bootstrap_d / TUM GT depth / backproject_patches_to_world use.
 
-    Returns dict with:
-      depth:        (B, R)     expected depth along ray (depth at which mass accumulates)
-      feature:      (B, R, D)  accumulated feature (for downstream consumers, e.g. pose head)
-      total_weight: (B, R)     cumulative accumulated weight (the "did ray hit anything" signal —
-                                used to mask unwritten pixels from the dense loss)
+    The physical length traversed per t-step is dt · ||ray_dir||, which
+    varies per pixel (||ray_dir|| ≥ 1, ≈ 1 at the principal point, larger
+    radially). The density-vs-path-length integration must use that physical
+    length so alpha is consistent across pixels.
+
+    Returns:
+      depth:        (B, R)     expected depth along CAMERA-Z axis (matches bootstrap_d / GT)
+      feature:      (B, R, D)  accumulated feature
+      total_weight: (B, R)     cumulative accumulated alpha-weight
     """
     cfg = state.cfg
     B, R, _ = ray_origins.shape
     device = ray_origins.device
 
-    # Sample depths along each ray.
+    # Sample positions in along-z depth (t in [near, far] is z-distance).
     t_vals = torch.linspace(near, far, n_samples, device=device, dtype=ray_origins.dtype)
     t_vals = t_vals.view(1, 1, n_samples, 1)                # (1, 1, S, 1)
-    # Sample points: origin + direction * t.
+    # pt = origin + t · ray_dir. Since ray_dir has z=1 in cam frame,
+    # the resulting pt has z = t (in cam frame), i.e. t IS along-z depth.
     pts = ray_origins.unsqueeze(2) + ray_dirs.unsqueeze(2) * t_vals  # (B, R, S, 3)
     pts_flat = pts.reshape(B, R * n_samples, 3)
     sampled_feat, sampled_mass = trilinear_sample_grid(state, pts_flat)
     sampled_feat = sampled_feat.view(B, R, n_samples, cfg.feature_dim)
     sampled_mass = sampled_mass.view(B, R, n_samples)
 
-    # Standard NeRF-style accumulation. Treat sampled_mass as density per
-    # unit length; compute alpha = 1 - exp(-density * dt).
+    # NeRF-style accumulation with PER-RAY physical path length.
+    # Each t-step covers dt·||ray_dir|| of actual 3D length.
+    # alpha = 1 - exp(-density · physical_step_length) so corners (where
+    # ||ray_dir|| > 1) accumulate more per sample than center pixels — that's
+    # the correct geometry, not a bug, because each sample on a corner ray
+    # spans a longer physical path through the grid.
     dt = (far - near) / n_samples
-    density = torch.relu(sampled_mass)                       # ≥ 0
-    alpha = 1.0 - torch.exp(-density * dt)                   # (B, R, S)
-    # Transmittance: T_i = product over j<i of (1 - alpha_j).
+    ray_norm = ray_dirs.norm(dim=-1, keepdim=True).clamp_min(1e-6)        # (B, R, 1)
+    step_length = dt * ray_norm                                             # (B, R, 1)
+    density = torch.relu(sampled_mass)                                      # (B, R, S)
+    alpha = 1.0 - torch.exp(-density * step_length)                         # (B, R, S)
     T = torch.cumprod(1.0 - alpha + 1e-10, dim=-1)
-    T = torch.cat([torch.ones_like(T[..., :1]), T[..., :-1]], dim=-1)  # shift right
-    w = alpha * T                                            # (B, R, S) per-sample contribution
-    total_w = w.sum(dim=-1)                                   # (B, R)
-    # Expected depth.
+    T = torch.cat([torch.ones_like(T[..., :1]), T[..., :-1]], dim=-1)
+    w = alpha * T
+    total_w = w.sum(dim=-1)
+    # Expected depth = ∑ w · t. With t = along-z, depth is along-z directly.
     t_per_sample = t_vals.view(1, 1, n_samples).expand(B, R, n_samples)
-    depth = (w * t_per_sample).sum(dim=-1)                    # (B, R)
-    # Accumulated feature.
-    feature = (w.unsqueeze(-1) * sampled_feat).sum(dim=-2)    # (B, R, D)
+    depth = (w * t_per_sample).sum(dim=-1)
+    feature = (w.unsqueeze(-1) * sampled_feat).sum(dim=-2)
     return {"depth": depth, "feature": feature, "total_weight": total_w}
 
 
