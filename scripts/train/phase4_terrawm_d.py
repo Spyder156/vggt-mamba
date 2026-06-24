@@ -319,6 +319,7 @@ def main() -> None:
         use_photometric=cfg["model"].get("use_photometric", False),
         photometric_hidden=cfg["model"].get("photometric_hidden", 64),
         photometric_pose_gradient=cfg["model"].get("photometric_pose_gradient", False),
+        pose_supervision_mode=cfg["model"].get("pose_supervision_mode", "predicted"),
     ).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[d-train] trainable params: {n_train/1e6:.2f}M  "

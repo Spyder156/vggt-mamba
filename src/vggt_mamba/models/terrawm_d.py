@@ -109,6 +109,10 @@ class TerraWM_D(nn.Module):
         # the inversion regime: replace the bad geometric pose signal with a good
         # photometric one. Co-guarded by the scene-state ablation (post-reset Δt).
         photometric_pose_gradient: bool = False,
+        # Pose supervision mode — see body below. "predicted" (default) is the
+        # current behaviour; "gt_replace" isolates the dense head for the cheat-
+        # pose diagnostic.
+        pose_supervision_mode: str = "predicted",
     ):
         super().__init__()
         self.encoder = encoder
@@ -166,6 +170,24 @@ class TerraWM_D(nn.Module):
         # into the pose head. Co-guarded by scene-state ablation.
         self.photometric_pose_gradient = photometric_pose_gradient
 
+        # === CHEAT-CODE POSE SUPERVISION MODE ===
+        # Isolates the dense-head/voxel-features half from the pose-head half
+        # for diagnostic purposes. Settings:
+        #   "predicted" (default): pose head's corrected_pose_T drives WRITE +
+        #     render2. This is what happens at inference and what we've been
+        #     training. Pose head loss still applies.
+        #   "gt_replace": pose head still runs and is still supervised by L_pose
+        #     against gt_delta, BUT WRITE + render2 use the GT pose for this
+        #     frame (passed in by forward()) instead of corrected_pose_T. This
+        #     isolates the dense head / voxel features / encoder / bootstrap_d
+        #     half — they train against perfect poses. If depth quality (abs_rel)
+        #     improves dramatically in this mode, the per-frame depth ceiling is
+        #     pose-limited; if it stays at ~0.36-0.39, the ceiling is in the
+        #     dense head's bilinear upsample or something architectural.
+        # Only usable during training (forward() with gt_poses_w_c supplied).
+        # Streaming_forward at inference ignores the flag (no GT available).
+        self.pose_supervision_mode = pose_supervision_mode
+
         # Pose-head no-bypass gate mode. The gate multiplies the MLP output to
         # force delta=identity when "the grid has nothing to say." Two definitions:
         #   "coverage" (default): use per-render-call ray coverage. Fires on cold
@@ -220,6 +242,7 @@ class TerraWM_D(nn.Module):
         fov_passthrough: torch.Tensor,   # (B, 2)
         return_diagnostics: bool = False,
         rgb_frame: torch.Tensor | None = None,   # (B, 3, H, W) — current frame, for photo mismatch diagnostic
+        gt_pose_this_frame_T: torch.Tensor | None = None,   # (B, 4, 4) — used iff pose_supervision_mode="gt_replace"
     ) -> dict[str, torch.Tensor]:
         B = patches.shape[0]
         device = patches.device
@@ -259,7 +282,21 @@ class TerraWM_D(nn.Module):
         delta_pose_T = cam9_to_pose_w_c(delta_pose_9)                       # (B, 4, 4)
         corrected_pose_T = initial_pose_T.float() @ delta_pose_T            # (B, 4, 4)
 
-        # WRITE: project patches to 3D via (corrected abs pose, bootstrap depth), scatter.
+        # === Pose dispatch for WRITE + 2nd RENDER ===
+        # The pose head's output (corrected_pose_T) is always trained against
+        # gt_delta via L_pose. But which pose actually drives the WRITE and 2nd
+        # RENDER (and thus L_render, L_photometric, L_mvc) depends on the mode:
+        #   "predicted": use corrected_pose_T. The default; current behaviour.
+        #   "gt_replace": use the per-frame GT pose passed in. This isolates the
+        #     dense-head / voxel-features / bootstrap_d half from the pose-head
+        #     half — they see perfect poses, so their loss reflects only their
+        #     own quality. Pose head still trains against gt_delta.
+        if self.pose_supervision_mode == "gt_replace" and gt_pose_this_frame_T is not None:
+            pose_downstream_T = gt_pose_this_frame_T.float()
+        else:
+            pose_downstream_T = corrected_pose_T
+
+        # WRITE: project patches to 3D via (downstream abs pose, bootstrap depth), scatter.
         # Pose is ALWAYS detached at the write step (firewalls render-loss from pushing
         # the pose head — separate stability concern). Bootstrap depth is conditionally
         # detached: when differentiable_write_geometry=True, bootstrap_d keeps its
@@ -270,13 +307,13 @@ class TerraWM_D(nn.Module):
             # Keep bootstrap_d's gradient; pose still detached.
             world_pts = backproject_patches_to_world(
                 patch_pixel, bootstrap_d, K_intrinsics,
-                corrected_pose_T.detach(),
+                pose_downstream_T.detach(),
             )                                                                # (B, P, 3) — has grad through bootstrap_d
         else:
             with torch.no_grad():
                 world_pts = backproject_patches_to_world(
                     patch_pixel, bootstrap_d.detach(), K_intrinsics,
-                    corrected_pose_T.detach(),
+                    pose_downstream_T.detach(),
                 )                                                            # (B, P, 3) — fully detached
         # Patch → voxel feature projection IS differentiable (so Loss_render
         # flows back through it into the projection weights and patches).
@@ -301,9 +338,9 @@ class TerraWM_D(nn.Module):
         #     positive (the pre-registered gate post-train). Scene-state
         #     ablation co-guards against bypass induction.
         pose_for_render2 = (
-            corrected_pose_T
+            pose_downstream_T
             if (self.use_photometric and self.photometric_pose_gradient)
-            else corrected_pose_T.detach()
+            else pose_downstream_T.detach()
         )
         ray_o2, ray_d2 = build_rays_from_pose(pose_for_render2, K_intrinsics, patch_pixel)
         render2 = render_rays_volumetric(
@@ -465,10 +502,17 @@ class TerraWM_D(nn.Module):
                     initial_T = gt_poses_w_c[:, ti - 1]
             else:
                 initial_T = torch.eye(4, device=device).expand(B, 4, 4).contiguous()
+            # For cheat-pose mode, pass the per-frame GT pose into _frame_step
+            # so it can be used downstream (write + render2) instead of the
+            # pose head's output. Only effective when pose_supervision_mode="gt_replace".
+            gt_this = gt_poses_w_c[:, ti] if (
+                gt_poses_w_c is not None and self.pose_supervision_mode == "gt_replace"
+            ) else None
             step_out = self._frame_step(
                 patches, voxel_state, initial_T, K_intrinsics, fov[:, ti],
                 return_diagnostics=return_diagnostics,
                 rgb_frame=rgb[:, ti] if (self.use_photometric or return_diagnostics) else None,
+                gt_pose_this_frame_T=gt_this,
             )
             out_depth.append(step_out["depth"])
             out_mask.append(step_out["depth_mask"])
@@ -580,6 +624,7 @@ def build_terrawm_d(
     use_photometric: bool = False,
     photometric_hidden: int = 64,
     photometric_pose_gradient: bool = False,
+    pose_supervision_mode: str = "predicted",
 ) -> TerraWM_D:
     weights_root = Path(weights_root)
     if encoder_name == "dinov3":
@@ -621,6 +666,7 @@ def build_terrawm_d(
         use_photometric=use_photometric,
         photometric_hidden=photometric_hidden,
         photometric_pose_gradient=photometric_pose_gradient,
+        pose_supervision_mode=pose_supervision_mode,
     )
 
 
