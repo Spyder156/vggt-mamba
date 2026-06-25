@@ -260,10 +260,69 @@ def main():
     rr.save(str(args.out_dir / "recording.rrd"))
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)                # TUM convention: +y down, +z forward
 
+    # === GLOBAL point clouds (merged from all frames, static, NOT on timeline) ===
+    # VGGT does a JOINT forward pass producing globally-consistent depth maps;
+    # we merge all 24 frames' aligned per-pixel point clouds into ONE static cloud
+    # so the viewer shows the entire scene at once instead of one frame at a time.
+    print(f"[vggt-tum] building global merged point clouds...")
+    pts_pred_all, colors_pred_all = [], []
+    pts_gt_all, colors_gt_all = [], []
+    fx, fy, cx, cy = intrinsics_for(args.seq)
+    sx, sy = img_w / 640.0, img_h / 480.0
+    K_gt_scaled = np.array([[fx*sx, 0, cx*sx], [0, fy*sy, cy*sy], [0, 0, 1.0]])
+    K_inv_gt = np.linalg.inv(K_gt_scaled)
+    for i, rec in enumerate(recs):
+        rgb_for_log = images_t[i].permute(1, 2, 0).float().cpu().numpy()
+        rgb_u8 = (rgb_for_log * 255).clip(0, 255).astype(np.uint8)
+        # Predicted: VGGT's aligned world_points
+        conf_mask = depth_conf_np[i] > args.vggt_conf_thresh
+        if conf_mask.sum() > 0:
+            pts_pred_all.append(world_points_aligned[i][conf_mask])
+            colors_pred_all.append(rgb_u8[conf_mask])
+        # GT: backproject TUM GT depth via TUM GT pose
+        gt_d = np.asarray(Image.open(rec.depth_path).resize((img_w, img_h), Image.NEAREST),
+                           dtype=np.float32) / 5000.0
+        gt_valid = (gt_d > 0.1) & (gt_d < 8.0)
+        if gt_valid.sum() > 0:
+            P_gt = gt_poses[i]
+            us, vs = np.meshgrid(np.arange(img_w), np.arange(img_h))
+            uu, vv = us[gt_valid].astype(np.float32), vs[gt_valid].astype(np.float32)
+            dd = gt_d[gt_valid]
+            pix_h = np.stack([uu, vv, np.ones_like(uu)], axis=-1)
+            cam_dir = pix_h @ K_inv_gt.T                                             # z=1
+            P_cam = cam_dir * dd[:, None]
+            P_world = P_cam @ P_gt[:3, :3].T + P_gt[:3, 3]
+            pts_gt_all.append(P_world)
+            colors_gt_all.append(rgb_u8[gt_valid])
+    if pts_pred_all:
+        pts_pred_global = np.concatenate(pts_pred_all)
+        colors_pred_global = np.concatenate(colors_pred_all)
+        # Subsample if too dense for the viewer
+        max_pts = 2_000_000
+        if len(pts_pred_global) > max_pts:
+            idx_sub = np.random.choice(len(pts_pred_global), max_pts, replace=False)
+            pts_pred_global = pts_pred_global[idx_sub]
+            colors_pred_global = colors_pred_global[idx_sub]
+        rr.log("world/points_pred_global",
+                rr.Points3D(pts_pred_global, colors=colors_pred_global, radii=0.005),
+                static=True)
+        print(f"  pred global: {len(pts_pred_global):,} points")
+    if pts_gt_all:
+        pts_gt_global = np.concatenate(pts_gt_all)
+        colors_gt_global = np.concatenate(colors_gt_all)
+        if len(pts_gt_global) > 2_000_000:
+            idx_sub = np.random.choice(len(pts_gt_global), 2_000_000, replace=False)
+            pts_gt_global = pts_gt_global[idx_sub]
+            colors_gt_global = colors_gt_global[idx_sub]
+        rr.log("world/points_gt_global",
+                rr.Points3D(pts_gt_global, colors=colors_gt_global, radii=0.005),
+                static=True)
+        print(f"  gt   global: {len(pts_gt_global):,} points")
+
+    # === Per-frame cameras on the timeline (animated frustums + image planes) ===
     for i, rec in enumerate(recs):
         rr.set_time_sequence("frame", i)
         rgb_for_log = images_t[i].permute(1, 2, 0).float().cpu().numpy()             # (H, W, 3) in [0,1]
-        # convert to uint8 for log
         rgb_u8 = (rgb_for_log * 255).clip(0, 255).astype(np.uint8)
 
         # ----- VGGT predicted camera (ALIGNED to TUM scale via Umeyama) -----
@@ -288,32 +347,8 @@ def main():
                             principal_point=[cx * sx, cy * sy],
                             width=img_w, height=img_h, image_plane_distance=0.2))
 
-        # ----- Predicted point cloud (ALIGNED to TUM scale) -----
-        pts_pred = world_points_aligned[i]                                            # (H, W, 3) in TUM metric scale
-        conf_mask = depth_conf_np[i] > args.vggt_conf_thresh
-        if conf_mask.sum() > 0:
-            pts = pts_pred[conf_mask]                                                # (M, 3)
-            colors = rgb_u8[conf_mask]                                               # (M, 3)
-            rr.log(f"world/points_pred", rr.Points3D(pts, colors=colors, radii=0.005))
-
-        # ----- GT point cloud (TUM GT depth back-projected with GT pose) -----
-        gt_d = np.asarray(Image.open(rec.depth_path).resize((img_w, img_h), Image.NEAREST),
-                           dtype=np.float32) / 5000.0
-        gt_valid = (gt_d > 0.1) & (gt_d < 8.0)
-        if gt_valid.sum() > 0:
-            us, vs = np.meshgrid(np.arange(img_w), np.arange(img_h))
-            uu = us[gt_valid].astype(np.float32)
-            vv = vs[gt_valid].astype(np.float32)
-            dd = gt_d[gt_valid]
-            # backproject in GT camera frame
-            K_inv = np.linalg.inv(np.array([[fx*sx, 0, cx*sx], [0, fy*sy, cy*sy], [0, 0, 1.0]]))
-            pix_h = np.stack([uu, vv, np.ones_like(uu)], axis=-1)                    # (M, 3)
-            cam_dir = pix_h @ K_inv.T                                                # (M, 3)  z=1
-            P_cam = cam_dir * dd[:, None]                                            # (M, 3)
-            R = P_gt[:3, :3]; t = P_gt[:3, 3]
-            P_world = P_cam @ R.T + t                                                # (M, 3)
-            colors = rgb_u8[gt_valid]
-            rr.log(f"world/points_gt", rr.Points3D(P_world, colors=colors, radii=0.005))
+        # (per-frame point clouds intentionally omitted — global merged clouds
+        # are logged once as static above. Each frame keeps its camera + image.)
 
     print(f"[vggt-tum] DONE — open the recording with:")
     print(f"    rerun {args.out_dir / 'recording.rrd'}")
