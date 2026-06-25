@@ -34,9 +34,8 @@ services:
     ipc: host
     stdin_open: true
     tty: true
-    # Ports for jupyter / tensorboard / rerun
+    # Ports for jupyter / tensorboard. (rerun port 9876 left to the host viewer.)
     ports:
       - "8888:8888"
       - "6006:6006"
-      - "9876:9876"
     command: ["bash"]

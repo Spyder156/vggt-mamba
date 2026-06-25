@@ -69,12 +69,45 @@ def pose_error_m(R_pred: np.ndarray, t_pred: np.ndarray,
                   R_gt: np.ndarray, t_gt: np.ndarray) -> tuple[float, float]:
     """Translation L2 (meters) + rotation geodesic (radians)."""
     t_err = float(np.linalg.norm(t_pred - t_gt))
-    # Rotation error: angle of R_pred R_gt^T
     R_err_mat = R_pred @ R_gt.T
     cos_theta = (np.trace(R_err_mat) - 1.0) / 2.0
     cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
     r_err = float(np.arccos(cos_theta))
     return t_err, r_err
+
+
+def umeyama_alignment(X: np.ndarray, Y: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Standard Umeyama similarity alignment: find s, R, t such that
+    Y ≈ s * R @ X + t (least-squares).
+    X, Y: (N, 3) — source and target point sets.
+    Returns (scale, rotation matrix, translation vector).
+    """
+    assert X.shape == Y.shape and X.shape[1] == 3
+    n = X.shape[0]
+    mu_x = X.mean(axis=0)
+    mu_y = Y.mean(axis=0)
+    Xc = X - mu_x
+    Yc = Y - mu_y
+    Sigma = (Yc.T @ Xc) / n
+    U, D, Vt = np.linalg.svd(Sigma)
+    S_diag = np.eye(3)
+    if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+        S_diag[2, 2] = -1
+    R = U @ S_diag @ Vt
+    var_x = float(np.sum(Xc * Xc) / n)
+    scale = float(np.trace(np.diag(D) @ S_diag) / max(var_x, 1e-12))
+    t = mu_y - scale * R @ mu_x
+    return scale, R, t
+
+
+def apply_similarity_to_pose(T_in: np.ndarray, scale: float, R_align: np.ndarray,
+                              t_align: np.ndarray) -> np.ndarray:
+    """Apply similarity (s, R, t) to a 4x4 world-from-cam pose T_in.
+    Result: a 4x4 pose whose translation is s*R@T_in.t + t and rotation is R@T_in.R."""
+    T_out = np.eye(4)
+    T_out[:3, :3] = R_align @ T_in[:3, :3]
+    T_out[:3, 3] = scale * (R_align @ T_in[:3, 3]) + t_align
+    return T_out
 
 
 def main():
@@ -145,47 +178,81 @@ def main():
     P0_pred_inv = np.linalg.inv(pred_pose_wc[0])
     pred_poses = np.einsum("ij,njk->nik", P0_pred_inv, pred_pose_wc)
 
+    # === Umeyama alignment: VGGT predictions → TUM GT scale ===
+    # VGGT predicts up-to-similarity reconstructions (Co3D-style, not metric).
+    # We compute the similarity transform (s, R, t) that best aligns the predicted
+    # camera positions to GT camera positions, then APPLY it to predicted poses
+    # AND predicted point clouds so they are directly comparable in metric scale.
+    pred_centers = pred_poses[:, :3, 3]                                              # (N, 3)
+    gt_centers = gt_poses[:, :3, 3]                                                  # (N, 3)
+    scale, R_align, t_align = umeyama_alignment(pred_centers, gt_centers)
+    print(f"\n[vggt-tum] === UMEYAMA ALIGNMENT (VGGT → TUM scale) ===")
+    print(f"  scale  = {scale:.4f}  (predicted scene was {scale:.2f}× of TUM metric)")
+    print(f"  R_align = (rotation matrix)\n{R_align}")
+    print(f"  t_align = {t_align}")
+
+    # Apply to all predicted poses
+    pred_poses_aligned = np.zeros_like(pred_poses)
+    for i in range(len(recs)):
+        pred_poses_aligned[i] = apply_similarity_to_pose(pred_poses[i], scale, R_align, t_align)
+
+    # Apply to predicted world_points (these are in VGGT's "world" frame, which is cam-0
+    # before our relativization; align them the same way).
+    world_points_aligned = scale * (world_points_np @ R_align.T) + t_align
+    # Same for depth-derived point cloud — actually depth values themselves are scalar
+    # along-z distances at each pixel; we just need to scale them.
+    depth_np_aligned = depth_np * scale
+
     # === Pose error per frame ===
     print(f"\n[vggt-tum] === POSE ERROR (relative to first sampled frame) ===")
-    print(f"  {'i':>3}  {'frame':>5}  {'|t|_pred':>10}  {'|t|_gt':>10}  "
-           f"{'t_err':>10}  {'r_err(deg)':>10}")
-    pose_errs_t = []
-    pose_errs_r = []
+    print(f"  {'i':>3}  {'frame':>5}  {'|t|_pred':>10}  {'|t|_aligned':>12}  {'|t|_gt':>10}  "
+           f"{'t_err_raw':>10}  {'t_err_aln':>10}  {'r_err(deg)':>10}")
+    pose_errs_t_raw, pose_errs_t_aln, pose_errs_r = [], [], []
     for i, fi in enumerate(idx):
         t_p = pred_poses[i, :3, 3]
+        t_p_aln = pred_poses_aligned[i, :3, 3]
         t_g = gt_poses[i, :3, 3]
         R_p = pred_poses[i, :3, :3]
         R_g = gt_poses[i, :3, :3]
-        t_err, r_err = pose_error_m(R_p, t_p, R_g, t_g)
-        pose_errs_t.append(t_err)
+        t_err_raw, r_err = pose_error_m(R_p, t_p, R_g, t_g)
+        t_err_aln = float(np.linalg.norm(t_p_aln - t_g))
+        pose_errs_t_raw.append(t_err_raw)
+        pose_errs_t_aln.append(t_err_aln)
         pose_errs_r.append(r_err)
-        print(f"  {i:>3}  {fi:>5}  {np.linalg.norm(t_p):>10.3f}  {np.linalg.norm(t_g):>10.3f}  "
-               f"{t_err:>10.3f}  {np.degrees(r_err):>10.2f}")
-    print(f"  Mean translation error: {float(np.mean(pose_errs_t)):.3f} m")
-    print(f"  Mean rotation error:    {np.degrees(np.mean(pose_errs_r)):.2f} deg")
+        print(f"  {i:>3}  {fi:>5}  {np.linalg.norm(t_p):>10.3f}  {np.linalg.norm(t_p_aln):>12.3f}  "
+               f"{np.linalg.norm(t_g):>10.3f}  {t_err_raw:>10.3f}  {t_err_aln:>10.3f}  "
+               f"{np.degrees(r_err):>10.2f}")
+    print(f"  Mean translation error  (raw, no align):     {float(np.mean(pose_errs_t_raw)):.3f} m")
+    print(f"  Mean translation error  (after Umeyama):     {float(np.mean(pose_errs_t_aln)):.3f} m")
+    print(f"  Mean rotation error     (scale-invariant):   {np.degrees(np.mean(pose_errs_r)):.2f} deg")
 
-    # === Depth error per frame (where both GT and VGGT-confident pixels exist) ===
+    # === Depth error per frame — RAW vs ALIGNED ===
     print(f"\n[vggt-tum] === DEPTH ERROR ===")
-    print(f"  {'i':>3}  {'abs_rel':>10}  {'mean_err_m':>12}  {'n_valid':>10}")
-    abs_rels = []
+    print(f"  {'i':>3}  {'abs_rel_raw':>12}  {'abs_rel_aln':>12}  "
+           f"{'mean_err_m_aln':>15}  {'n_valid':>10}")
+    abs_rels_raw, abs_rels_aln = [], []
     for i, rec in enumerate(recs):
-        # Load GT depth at VGGT's resolution
         gt_d = np.asarray(Image.open(rec.depth_path).resize((img_w, img_h), Image.NEAREST),
                            dtype=np.float32) / 5000.0
         gt_valid = (gt_d > 0.1) & (gt_d < 8.0)
         vggt_conf_mask = depth_conf_np[i] > args.vggt_conf_thresh
         mask = gt_valid & vggt_conf_mask
         if mask.sum() < 100:
-            print(f"  {i:>3}  {'-':>10}  {'-':>12}  {int(mask.sum()):>10}  (too few valid)")
+            print(f"  {i:>3}  {'-':>12}  {'-':>12}  {'-':>15}  {int(mask.sum()):>10}  (too few valid)")
             continue
-        pred_d = depth_np[i][mask]
+        pred_d_raw = depth_np[i][mask]
+        pred_d_aln = depth_np_aligned[i][mask]
         gt_d_m = gt_d[mask]
-        abs_rel = float(np.mean(np.abs(pred_d - gt_d_m) / np.clip(gt_d_m, 0.1, None)))
-        mean_err = float(np.mean(np.abs(pred_d - gt_d_m)))
-        abs_rels.append(abs_rel)
-        print(f"  {i:>3}  {abs_rel:>10.3f}  {mean_err:>12.3f}  {int(mask.sum()):>10}")
-    if abs_rels:
-        print(f"  Mean abs_rel: {float(np.mean(abs_rels)):.3f}")
+        abs_rel_raw = float(np.mean(np.abs(pred_d_raw - gt_d_m) / np.clip(gt_d_m, 0.1, None)))
+        abs_rel_aln = float(np.mean(np.abs(pred_d_aln - gt_d_m) / np.clip(gt_d_m, 0.1, None)))
+        mean_err_aln = float(np.mean(np.abs(pred_d_aln - gt_d_m)))
+        abs_rels_raw.append(abs_rel_raw)
+        abs_rels_aln.append(abs_rel_aln)
+        print(f"  {i:>3}  {abs_rel_raw:>12.3f}  {abs_rel_aln:>12.3f}  "
+               f"{mean_err_aln:>15.3f}  {int(mask.sum()):>10}")
+    if abs_rels_aln:
+        print(f"  Mean abs_rel (raw, no align):       {float(np.mean(abs_rels_raw)):.3f}")
+        print(f"  Mean abs_rel (after scale align):   {float(np.mean(abs_rels_aln)):.3f}")
 
     # === Log to Rerun ===
     print(f"\n[vggt-tum] writing Rerun recording to {args.out_dir}/recording.rrd ...")
@@ -199,8 +266,8 @@ def main():
         # convert to uint8 for log
         rgb_u8 = (rgb_for_log * 255).clip(0, 255).astype(np.uint8)
 
-        # ----- VGGT predicted camera -----
-        P_pred = pred_poses[i]                                                       # 4x4 world-from-cam, relative to first frame
+        # ----- VGGT predicted camera (ALIGNED to TUM scale via Umeyama) -----
+        P_pred = pred_poses_aligned[i]                                                # 4x4, in TUM metric scale
         rr.log("world/cam_pred",
                 rr.Transform3D(translation=P_pred[:3, 3], mat3x3=P_pred[:3, :3]))
         rr.log("world/cam_pred/image",
@@ -221,8 +288,8 @@ def main():
                             principal_point=[cx * sx, cy * sy],
                             width=img_w, height=img_h, image_plane_distance=0.2))
 
-        # ----- Predicted point cloud (VGGT depth back-projected) -----
-        pts_pred = world_points_np[i]                                                # (H, W, 3) in VGGT's coords (relative to first cam by VGGT convention)
+        # ----- Predicted point cloud (ALIGNED to TUM scale) -----
+        pts_pred = world_points_aligned[i]                                            # (H, W, 3) in TUM metric scale
         conf_mask = depth_conf_np[i] > args.vggt_conf_thresh
         if conf_mask.sum() > 0:
             pts = pts_pred[conf_mask]                                                # (M, 3)
