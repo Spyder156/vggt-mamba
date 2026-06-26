@@ -117,18 +117,42 @@ def main():
     if args.seq in TRAIN_SEQS:
         print(f"  WARNING: {args.seq} is a TRAIN seq. Held-out should be one of: {EVAL_SEQS}")
 
-    cfg = TerraWMConfig(
-        img_size=args.img_size,
-        d_model=args.d_model,
-        n_latents=args.n_latents,
-        n_write_blocks=args.n_write_blocks,
-        n_decode_blocks=args.n_decode_blocks,
-    )
-    model = TerraWMLinear(cfg).to(device).eval()
+    # If a ckpt is provided AND it stored the training cfg, use that — otherwise
+    # fall back to CLI flags. This guarantees model dims match the ckpt's
+    # shapes (frame_embed, latents, etc.).
+    ckpt_state = None
+    ckpt_cfg = None
     if args.ckpt is not None and not args.no_ckpt:
-        state = torch.load(args.ckpt, map_location="cpu")
-        if "model" in state:
-            state = state["model"]
+        ckpt_state = torch.load(args.ckpt, map_location="cpu")
+        ckpt_cfg = ckpt_state.get("cfg") if isinstance(ckpt_state, dict) else None
+
+    if ckpt_cfg is not None and "model" in ckpt_cfg:
+        m = ckpt_cfg["model"]
+        cfg = TerraWMConfig(
+            img_size=m["img_size"],
+            d_enc=m.get("d_enc", 1024),
+            d_model=m["d_model"],
+            n_heads=m.get("n_heads", 12),
+            n_latents=m["n_latents"],
+            n_write_blocks=m["n_write_blocks"],
+            n_decode_blocks=m["n_decode_blocks"],
+            encoder_repo=m.get("encoder_repo", "facebook/dinov3-vitl16-pretrain-lvd1689m"),
+            freeze_encoder=m.get("freeze_encoder", True),
+            max_frames=m.get("max_frames", 64),
+        )
+        print(f"using model cfg from ckpt (max_frames={cfg.max_frames}, d_model={cfg.d_model})")
+    else:
+        cfg = TerraWMConfig(
+            img_size=args.img_size,
+            d_model=args.d_model,
+            n_latents=args.n_latents,
+            n_write_blocks=args.n_write_blocks,
+            n_decode_blocks=args.n_decode_blocks,
+        )
+
+    model = TerraWMLinear(cfg).to(device).eval()
+    if ckpt_state is not None:
+        state = ckpt_state["model"] if "model" in ckpt_state else ckpt_state
         model.load_state_dict(state, strict=False)
         print(f"loaded ckpt: {args.ckpt}")
     else:
