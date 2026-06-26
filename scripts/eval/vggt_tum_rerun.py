@@ -178,30 +178,16 @@ def main():
     P0_pred_inv = np.linalg.inv(pred_pose_wc[0])
     pred_poses = np.einsum("ij,njk->nik", P0_pred_inv, pred_pose_wc)
 
-    # === Umeyama alignment: VGGT predictions → TUM GT scale ===
-    # VGGT predicts up-to-similarity reconstructions (Co3D-style, not metric).
-    # We compute the similarity transform (s, R, t) that best aligns the predicted
-    # camera positions to GT camera positions, then APPLY it to predicted poses
-    # AND predicted point clouds so they are directly comparable in metric scale.
-    pred_centers = pred_poses[:, :3, 3]                                              # (N, 3)
-    gt_centers = gt_poses[:, :3, 3]                                                  # (N, 3)
-    scale, R_align, t_align = umeyama_alignment(pred_centers, gt_centers)
-    print(f"\n[vggt-tum] === UMEYAMA ALIGNMENT (VGGT → TUM scale) ===")
-    print(f"  scale  = {scale:.4f}  (predicted scene was {scale:.2f}× of TUM metric)")
-    print(f"  R_align = (rotation matrix)\n{R_align}")
-    print(f"  t_align = {t_align}")
-
-    # Apply to all predicted poses
-    pred_poses_aligned = np.zeros_like(pred_poses)
-    for i in range(len(recs)):
-        pred_poses_aligned[i] = apply_similarity_to_pose(pred_poses[i], scale, R_align, t_align)
-
-    # Apply to predicted world_points (these are in VGGT's "world" frame, which is cam-0
-    # before our relativization; align them the same way).
-    world_points_aligned = scale * (world_points_np @ R_align.T) + t_align
-    # Same for depth-derived point cloud — actually depth values themselves are scalar
-    # along-z distances at each pixel; we just need to scale them.
-    depth_np_aligned = depth_np * scale
+    # === NO ALIGNMENT — let VGGT's joint global solve speak for itself ===
+    # The user's point: VGGT's cross-attention does multi-view stereo across all
+    # 24 frames jointly. The joint solve picks ONE consistent global scale that
+    # all frames share. We log VGGT's raw predictions at VGGT's chosen scale,
+    # and GT at TUM's metric scale, side-by-side. Each is internally consistent.
+    # The ratio between them is the scale ambiguity (~0.44× expected).
+    pred_poses_aligned = pred_poses                                                   # alias for downstream code
+    world_points_aligned = world_points_np
+    depth_np_aligned = depth_np
+    print(f"\n[vggt-tum] (skipping Umeyama — logging VGGT's RAW joint-solve output)")
 
     # === Pose error per frame ===
     print(f"\n[vggt-tum] === POSE ERROR (relative to first sampled frame) ===")
