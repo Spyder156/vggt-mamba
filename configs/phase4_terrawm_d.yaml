@@ -1,0 +1,165 @@
+# TerraWM-D MVP — voxel-grid world model on TUM-RGBD.
+#
+# Architecture rebuild after the recurrent-latent went inert three times.
+# The voxel grid is the only place scene info can live; every per-frame
+# output structurally routes through it.
+#
+# Pre-registered MVP verdict (locked, same discipline as A):
+#   Protocol: stream sitting_xyz, reset voxel grid (zero features + write_mass)
+#     at frame 200, measure post-reset mean Δt-magnitude difference between
+#     continuous and reset runs over frames 200–249.
+#   Threshold (LOCKED): ≥ 0.10 m  (50× TerraWM baseline of 0.00192 m)
+#   Reasoning: structural-rebuild should make state-dependence catastrophic,
+#     not just measurable. If D's reset-impact is < 0.10 m, the voxel grid
+#     is not actually load-bearing despite the architectural commitment, and
+#     the project pivots fundamentally (4th inert result = pattern, not noise).
+#
+# Why pose not depth for the ablation: zeroing the voxel grid kills rendered
+# depth's input, but the loss mask gates it out so depth-diff goes to
+# zero/undefined. Pose comes from render-and-compare, which arithmetically
+# cannot work with a zero grid. That's the test that exercises the no-bypass
+# property.
+
+encoder: dinov3
+seed: 0
+
+data:
+  root: /workspace/datasets/tum_rgbd
+  n_frames: 8
+  stride_train: 8
+  stride_eval: 16
+  frame_stride: 10
+  # Was [1, 30] mixture — but stride=1 had only ~3% sampling weight, so the
+  # model learned average behavior across the mixture (bad at both extremes).
+  # Pure [1, 1] is the cleanest test: train at EXACTLY the inference
+  # distribution, so the verdict is "mixture vs representation" without
+  # confound. If calibration fixes here, the residual problem was the mixture
+  # and the architecture is viable; if it stays broken, the architecture is.
+  randomize_stride: [1, 1]
+  depth_max_m: 8.0
+  # Explicit sequence selection. Bounds-fit check 2026-05-30:
+  #   sitting_xyz: cam bbox (1.1m) tiny; fits trivially in (-4,-4,-2, 4,4,8).
+  #   fr1/room:    cam bbox (3.4m); cam x∈[-1.16, 1.39], y∈[-1.35, 0.86], z∈[1.19, 1.70].
+  #                Fits inside bounds. Adds real motion + loop closures.
+  # Excluded: fr3/long_office (bbox 7.1m would risk OOB at long window).
+  train_seqs:
+    - rgbd_dataset_freiburg3_sitting_xyz
+    - rgbd_dataset_freiburg1_room
+  # Eval keeps the default (walking_* + sitting_*) — sitting_xyz overlap is
+  # acceptable for the 500-step diagnostic phase.
+  eval_seqs: null
+
+model:
+  n_intraframe_layers: 4
+  # Asymmetric z bounds: scene extends in +z direction from the camera (GT-pose
+  # occupancy showed world_z p05/p95 = +1.68/+8.02 m), and the camera barely
+  # moves in z (TUM sitting_xyz GT z range 0.10 m). Symmetric ±4 wastes the
+  # -4..0 slab behind the camera. xy stay ±4 (camera xy motion is small, scene
+  # is in front).
+  voxel_bounds: [-4.0, -4.0, -2.0, 4.0, 4.0, 8.0]
+  # Reverted to 64³ on 2026-06-01 — chosen foundation per sensitivity test.
+  # 64³ writeconf had STRONGER multi-axis grid-grounding than 128³ matched
+  # (max relative diff 0.93 vs 0.35, variation on x AND z AND rotation, not just z)
+  # AND 2× better depth (abs_rel 0.41 vs 0.82). 128³'s bigger ablation number
+  # was z-axis trajectory-integration artifact, not deeper grounding.
+  voxel_resolution: [64, 64, 64]
+  voxel_feature_dim: 32
+  # Render sampling — matched to voxel size. 64³ = 12.5cm voxel; 64 samples
+  # over 8m ray = 12.4cm step ≈ matched (Nyquist OK).
+  n_render_samples: 64
+  render_near: 0.1
+  render_far: 8.0
+  # Bootstrap depth head (write-only firewall)
+  bootstrap_hidden: 128
+  bootstrap_max_depth: 10.0
+  # Render-and-compare pose head
+  pose_head_hidden: 256
+  # Bounds RELAXED on 2026-06-03 because supervision is now scale-invariant.
+  # Under scale-invariant loss, a metric pose_max_dt is structurally meaningless
+  # (the model can output any scale and the loss is invariant). Bounds kept
+  # large enough to prevent catastrophic output (e.g. 100m deltas) but no
+  # longer constrain magnitude. The grid (metric bounds + bootstrap depth
+  # supervision) is the implicit scale anchor.
+  pose_max_dt: 1.0
+  pose_max_dq: 0.5
+  # Unwritten-voxel loss-mask threshold
+  unwritten_mask_threshold: 0.001
+  # Write-confidence head: per-patch scalar in [0, 1] applied at write time.
+  # Makes voxel mass DIFFERENTIABLE — gives the render loss a gradient path
+  # through depth (currently mass is constant-write so render_l1 is gradient
+  # starved and the pose head bypasses the grid). 68K params, sigmoid-bounded,
+  # zero-init (initial confidence = 0.5, neutral).
+  use_write_confidence: true
+  write_confidence_hidden: 64
+  # Differentiable write geometry: bootstrap_d keeps its gradient at the write step
+  # so render-loss can correct write positions via trilinear weight derivative
+  # (sub-voxel position correction). Closes the map-adjusts-to-image half of bundle
+  # adjustment that detached writes left open. The half-BA → closed-loop test.
+  # Pre-registered hypothesis: per-axis grid-sensitivity should rise on MORE axes
+  # (not just z), because the render now better reflects where features actually
+  # are. If yes → validated diagnosis (channels driven into agreement by gradient),
+  # Gaussian commit becomes the next investment with stronger evidence. If no →
+  # voxels structurally can't host the closed loop (discrete corner indexes block
+  # cross-voxel relocation), same Gaussian commit but stronger justification.
+  differentiable_write_geometry: true
+  # Photometric — fix for the geometric-channel inversion (β_disp_geom = -2.18,
+  # 95% CI [-2.99, -1.38] after controlling for coverage; see
+  # viz/output/terrawm_d_drift_blind_check/summary.json). ColorHead on rendered
+  # voxel features → per-patch + dense RGB prediction. Bypass-guarded (reads
+  # only rendered features). Pre-registered gate: β_disp_photo ≥ +1.0 after
+  # retrain (rerun drift_blind_check with photometric mismatch).
+  use_photometric: false           # flip to true when launching the photometric retrain
+  photometric_hidden: 64
+  # Photometric pose-gradient: when true, the 2nd render's pose is NOT detached
+  # → photometric loss flows back into the pose head. This is the point of
+  # photometric in the inversion regime: replace the bad geometric pose signal
+  # with a good photometric one. Co-guarded by scene-state ablation
+  # (post-reset Δt ≥ 0.10m).
+  photometric_pose_gradient: false  # flip to true when use_photometric=true
+
+loss:
+  w_render_l1: 1.0
+  w_render_log: 0.5
+  w_bootstrap: 1.0
+  w_pose: 1.0
+  w_mvc: 0.1
+  mvc_samples: 512               # smaller MVC sampling — D's forward is heavier
+  # Scale-invariant pose loss (Eigen log-variance + cosine + geodesic).
+  # On 2026-06-03 replaced tracking loss after TB showed model outputting
+  # constant-magnitude deltas: pattern correct but step-size constant regardless
+  # of GT step-size. Diagnosis: relative-L1 + bounded output makes constant
+  # magnitude provably-near-optimal across the training distribution. Even with
+  # more training and tracking-loss, scale_ratio stuck at 0.2.
+  # Scale-invariant log-variance loss removes the absolute-scale supervision;
+  # the grid + bootstrap depth anchor scale implicitly. Collapse-resistant
+  # (constant or zero pred both fail the log-variance test).
+  pose_scale_invariant: true
+  pose_w_scale_inv: 1.0
+  pose_w_cos: 1.0
+  pose_w_rot: 1.0
+  pose_w_fov: 0.1
+  # Disable tracking loss (the old path).
+  pose_tracking: false
+  # Photometric loss weight. 0 = disabled. Start at 1.0 for the photometric
+  # retrain (matched order of magnitude to w_render_l1).
+  w_photometric: 0.0
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+
+train:
+  steps: 2000
+  batch_size: 1
+  num_workers: 4
+  log_every: 25
+  eval_every: 500
+  ckpt_every: 1000
+  diag_every: 100              # grid mass + pose delta histogram dump
+  img_every: 500               # image panels (RGB / GT / pred / error / voxel projections / trajectory)
+  tensorboard: true            # SummaryWriter under <out_dir>/tb
+  precision: bfloat16
+
+output_dir: experiments/phase4_terrawm_d_seed0_pure1

@@ -1,0 +1,137 @@
+# TerraWM-D long-run — the real test of "world model vs photogrammetry".
+#
+# Three corrections to the original pure1/photometric configs, each tied to
+# a diagnostic finding from this arc:
+#
+# 1. DEPTH-CONSISTENCY UP-WEIGHTED — Depth-clean-grid diagnostic (2026-06-05):
+#    on the photometric ckpt, depth-refinement against a clean grid moves 66%
+#    of fires TOWARD GT (vs 52% for photometric, vs 41% photometric-streamed).
+#    Sign of mean Δ displacement FLIPPED: depth = -0.020m (toward), photometric
+#    = +0.016m (away). The corrective signal is depth, not color. render_l1 is
+#    structurally the depth-consistency loss already; bump weight 1.0 → 2.0.
+#    photometric kept (works as trigger signal, gives encoder guidance, no harm).
+#
+# 2. STRIDE NOT LOCKED TO [1,1] — pure1 validated [1,1] on 2 sequences; locking
+#    it on 6 diverse sequences would starve motion-magnitude variety. Going
+#    with [1, 5]: small range, exposes some variety, doesn't reintroduce the
+#    bad [1, 30] mixture problem. (Stride-aware head doesn't exist yet — the
+#    "validated in principle" the user referred to isn't implemented; data-level
+#    augmentation is the realistic substitute.)
+#
+# 3. HELD-OUT FR2/DESK — fr2/desk is NOT in train_seqs. It's the held-out
+#    evaluator (data.held_out_seq) for the per-checkpoint emergence test.
+#    fr2/desk is the sequence we characterized via drift-blind/RG runs, so
+#    we have prior measurements on it for context. Improvement on held-out =
+#    learning. Improvement only on trained = memorization.
+#
+# Pre-registered gates at step 40k:
+#   - Held-out fr2/desk mean Sim3-aligned ATE  ≤ 0.5m (vs current streaming ~3m)
+#   - Held-out fr2/desk survival_frame_1m       ≥ 800 (vs current ~250)
+#   - Eval cam_l1 (trained seqs)                ≤ 0.020 (vs current 0.028)
+#   - Eval abs_rel (trained seqs)               ≤ 0.30 (vs current 0.38)
+#   - Scene-state ablation post-reset Δt        ≥ 0.10m (bypass guard)
+#   - Loss curves cleanly decreasing in last 20%: if flat → extend to 80k
+#
+# Pre-registered branches per outcome:
+#   - Held-out cam_l1/abs_rel improve AND held-out survival_frame_1m improves
+#     across ckpts → world-model behavior emerging with scale. You were right.
+#   - Trained-seq metrics improve but held-out doesn't → memorization. Data
+#     diversity or architecture is the lever, not steps.
+#   - Per-frame metrics improve but held-out survival_frame_1m stays low →
+#     depth-loss sharpened per-frame but didn't fix long-horizon. Grid→pose
+#     weakness is architectural, now with clean evidence.
+#   - All metrics plateau 8k→40k → never undertraining; steps weren't the lever.
+
+encoder: dinov3
+seed: 0
+
+data:
+  root: /workspace/datasets/tum_rgbd
+  n_frames: 8
+  stride_train: 8
+  stride_eval: 16
+  frame_stride: 5
+  # CHANGED: was [1, 1] in pure1/photometric. [1, 5] exposes motion-magnitude
+  # variety across 6 diverse sequences without reintroducing the [1, 30] mixture
+  # calibration problem. Bracketed by what TUM sequences contain at varied
+  # camera speeds.
+  randomize_stride: [1, 5]
+  depth_max_m: 8.0
+  # 5 train sequences (was 2: sitting_xyz, fr1/room).
+  # fr2/desk is held out (data.held_out_seq below).
+  # Excluded from training: fr3/long_office (bbox 7.1m exceeds voxel bounds);
+  # fr3/structure_texture_far (not bbox-validated for this config).
+  train_seqs:
+    - rgbd_dataset_freiburg3_sitting_xyz
+    - rgbd_dataset_freiburg1_xyz
+    - rgbd_dataset_freiburg1_desk
+    - rgbd_dataset_freiburg1_room
+    - rgbd_dataset_freiburg2_xyz
+  eval_seqs: null              # defaults to EVAL_SEQS (fr3 walking_* + sitting_*)
+  # NEW: held-out sequence streamed in full at each ckpt for the emergence test.
+  held_out_seq: rgbd_dataset_freiburg2_desk
+
+model:
+  n_intraframe_layers: 4
+  voxel_bounds: [-4.0, -4.0, -2.0, 4.0, 4.0, 8.0]
+  voxel_resolution: [64, 64, 64]
+  voxel_feature_dim: 32
+  n_render_samples: 64
+  render_near: 0.1
+  render_far: 8.0
+  bootstrap_hidden: 128
+  bootstrap_max_depth: 10.0
+  pose_head_hidden: 256
+  pose_max_dt: 1.0
+  pose_max_dq: 0.5
+  unwritten_mask_threshold: 0.001
+  use_write_confidence: true
+  write_confidence_hidden: 64
+  differentiable_write_geometry: true
+  # Photometric: kept on (trigger signal stays valid; encoder guidance is
+  # cheap; no harm even though grad-into-pose-head doesn't correct drift).
+  use_photometric: true
+  photometric_hidden: 64
+  photometric_pose_gradient: true   # depth gradient ALSO flows into pose head via render2
+
+loss:
+  # CHANGED: w_render_l1 1.0 → 2.0. render_l1 IS the depth-consistency loss the
+  # diagnostic validated as the corrective signal. Upweighting amplifies it
+  # relative to the inverted geometric/photometric signals it competes with.
+  w_render_l1: 2.0
+  w_render_log: 0.5
+  w_bootstrap: 1.0
+  w_pose: 1.0
+  w_mvc: 0.1
+  mvc_samples: 512
+  pose_scale_invariant: true
+  pose_w_scale_inv: 1.0
+  pose_w_cos: 1.0
+  pose_w_rot: 1.0
+  pose_w_fov: 0.1
+  pose_tracking: false
+  w_photometric: 1.0
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+
+train:
+  # CHANGED: 8000 → 40000. Pure1 + photometric were both 8k MVPs; never tested
+  # whether the model actually plateaus. 5× more training across 3× more data
+  # is the genuine test of "did the diagnostic-fixed loss stack carry."
+  steps: 40000
+  batch_size: 1
+  num_workers: 4
+  log_every: 50
+  eval_every: 1000
+  ckpt_every: 8000              # ckpts at 8k, 16k, 24k, 32k, 40k (5 total)
+  diag_every: 200
+  img_every: 2000
+  tier4_every: 100
+  tensorboard: true
+  precision: bfloat16
+
+output_dir: experiments/phase4_terrawm_d_seed0_longrun

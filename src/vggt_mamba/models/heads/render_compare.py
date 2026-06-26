@@ -1,0 +1,176 @@
+"""TerraWM-D: render-and-compare pose head.
+
+The no-bypass pose mechanism. At frame t:
+
+  1. An initial pose estimate is supplied (typically previous-frame's predicted
+     pose, detached, or identity / GT[0] at frame 0).
+  2. The voxel grid is rendered from the initial pose to produce per-ray
+     features (one ray per patch pixel center, B × P rays).
+  3. The current frame's intra-attended patch features are projected to the
+     same dim as voxel features (so they're comparable).
+  4. A discrepancy = current_proj - rendered_feature per patch, weighted by
+     per-ray total_weight (zero where no voxels were hit — the ray missed
+     everything written so far).
+  5. Pool the discrepancies + total_weight signal → MLP → (Δt_3, Δq_4).
+  6. Final pose = initial_pose ⊕ (Δt, Δq) [translation adds, quat composes].
+
+The final layer of the correction MLP is zero-initialised, so at init the
+delta is exactly 0 and the corrected pose = initial pose. The MLP then learns
+to produce non-zero corrections ONLY by using the render-vs-current
+discrepancy — there is no path for it to bypass the rendered features
+(which depend on the voxel grid). When the voxel grid is empty,
+rendered_feature = 0 and total_weight = 0; the discrepancy carries no
+information and the head outputs the same delta regardless of input — the
+zero-grid smoke test confirms this.
+
+Quaternion composition uses Hamilton product (always produces unit quats).
+"""
+from __future__ import annotations
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def quat_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Hamilton product of two quaternions (qx, qy, qz, qw). (..., 4) → (..., 4)."""
+    ax, ay, az, aw = a.unbind(-1)
+    bx, by, bz, bw = b.unbind(-1)
+    return torch.stack([
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ], dim=-1)
+
+
+class RenderCompareHead(nn.Module):
+    """current-frame features + voxel-rendered features → (Δt, Δq) correction.
+
+    Args:
+      patch_dim: current frame's patch feature dim (e.g. 1024 from DINOv3).
+      voxel_dim: voxel feature dim (e.g. 32). The render output is in this dim.
+      hidden:    MLP hidden width for the correction layer.
+      max_dt:    cap on per-frame translation correction magnitude (m). Per-axis tanh-bounded.
+      max_dq:    cap on per-frame quaternion small-angle correction. Per-axis tanh-bounded.
+    """
+
+    def __init__(
+        self,
+        patch_dim: int = 1024,
+        voxel_dim: int = 32,
+        hidden: int = 256,
+        max_dt: float = 0.30,
+        max_dq: float = 0.15,
+    ):
+        super().__init__()
+        self.patch_dim = patch_dim
+        self.voxel_dim = voxel_dim
+        self.max_dt = max_dt
+        self.max_dq = max_dq
+        # Project current patches to voxel-feature dim so they're comparable.
+        self.current_proj = nn.Sequential(
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, voxel_dim),
+        )
+        # Comparison MLP: in = (pooled_discrepancy + pooled_current + scalar_coverage)
+        # = voxel_dim + voxel_dim + 1
+        in_dim = voxel_dim * 2 + 1
+        self.compare = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Linear(hidden // 2, 7),                       # (Δt_3, Δq_4)
+        )
+        # Zero-init final layer so init correction = 0.
+        nn.init.zeros_(self.compare[-1].weight)
+        nn.init.zeros_(self.compare[-1].bias)
+
+    def forward(
+        self,
+        current_patches: torch.Tensor,   # (B, P, patch_dim) current frame's intra-attended patches
+        rendered_feature: torch.Tensor,  # (B, P, voxel_dim) voxel-rendered per-patch features at initial pose
+        ray_total_weight: torch.Tensor,  # (B, P) cumulative weight from rendering (0 = ray hit nothing)
+        initial_pose: torch.Tensor,      # (B, 9) fov passes through; the rest is unused (delta is camera-frame)
+        external_gate: torch.Tensor | None = None,  # (B, 1) override for the no-bypass multiplier
+    ) -> torch.Tensor:
+        """Returns (B, 9) DELTA pose: per-frame relative motion in the
+        previous-frame's camera coordinates. fov is passed through unchanged.
+
+        Output is camera_delta semantics — directly comparable to
+        `gt_relative_motion_from_abs_poses` output for the per-frame pose loss.
+        To recover the absolute world-from-camera pose at frame t, caller
+        composes: T_world_t = T_world_{t-1} @ cam9_to_pose_w_c(delta_9).
+        """
+        B = current_patches.shape[0]
+        current_proj = self.current_proj(current_patches)                       # (B, P, voxel_dim)
+        diff = current_proj - rendered_feature                                  # (B, P, voxel_dim)
+        # Per-ray weight: total_weight measures how much voxel content the ray
+        # accumulated. Use it to weight the per-patch discrepancy contribution.
+        w = ray_total_weight.unsqueeze(-1).clamp(min=0.0)                       # (B, P, 1)
+        w_sum = w.sum(dim=1).clamp_min(1e-6)                                    # (B, 1)
+        pooled_diff = (diff * w).sum(dim=1) / w_sum                             # (B, voxel_dim)
+        pooled_cur = (current_proj * w).sum(dim=1) / w_sum                      # (B, voxel_dim)
+        coverage = (ray_total_weight > 1e-3).float().mean(dim=1, keepdim=True)  # (B, 1)
+        mlp_in = torch.cat([pooled_diff, pooled_cur, coverage], dim=-1)         # (B, 2*voxel_dim+1)
+        delta_raw = self.compare(mlp_in)                                         # (B, 7)
+        # STRUCTURAL NO-BYPASS GATE: multiply raw delta by a [0,1] scalar.
+        # Default = per-call render coverage (original behavior, suited to
+        # cold-start protection). But this conflates "grid is empty" (cold
+        # start) with "camera is pointing at unwritten region of a populated
+        # grid" (long-horizon drift). The latter triggers a self-perpetuating
+        # freeze: coverage=0 → delta=identity → camera doesn't move → render
+        # stays empty. external_gate allows the caller to substitute a
+        # grid-mass-based signal (1 if grid is meaningfully populated, 0 if
+        # truly empty) that doesn't fire on the drift case.
+        gate = external_gate if external_gate is not None else coverage
+        delta_raw = delta_raw * gate                                              # (B, 7)
+        dt = torch.tanh(delta_raw[:, :3]) * self.max_dt                         # (B, 3) bounded camera-frame delta translation
+        dq_perturb = torch.tanh(delta_raw[:, 3:7]) * self.max_dq                # (B, 4) small-angle quat perturbation
+        # Delta quaternion: identity baseline (0,0,0,1) + small perturbation, renormalized.
+        # With zero-init MLP, dq_perturb=0 -> delta_q=(0,0,0,1) = identity rotation.
+        identity_q = torch.zeros_like(dq_perturb)
+        identity_q[:, 3] = 1.0
+        q_unnorm = identity_q + dq_perturb
+        delta_q = q_unnorm / q_unnorm.norm(dim=-1, keepdim=True).clamp_min(1e-3)
+        # fov is intrinsic — pass through from the initial-pose input.
+        init_fov = initial_pose[:, 7:].float()
+        return torch.cat([dt, delta_q, init_fov], dim=-1)                        # (B, 9) DELTA pose
+
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    head = RenderCompareHead(patch_dim=1024, voxel_dim=32).cuda()
+    B, P = 1, 1024
+    current = torch.randn(B, P, 1024, device="cuda")
+    rendered = torch.randn(B, P, 32, device="cuda") * 0.3
+    weight = torch.rand(B, P, device="cuda") * 0.5
+    init_pose = torch.tensor([[0., 0., 0., 0., 0., 0., 1., 1.0, 1.0]], device="cuda")
+
+    delta = head(current, rendered, weight, init_pose)
+    print(f"[render-cmp] in: current {tuple(current.shape)}, rendered {tuple(rendered.shape)}, "
+          f"weight {tuple(weight.shape)}, init_pose {tuple(init_pose.shape)}")
+    print(f"[render-cmp] out delta: {tuple(delta.shape)} = {delta[0].tolist()}")
+    # At init (zero-init MLP), delta should be identity: (0,0,0,0,0,0,1, fov).
+    identity_delta = torch.tensor([[0., 0., 0., 0., 0., 0., 1., 1.0, 1.0]], device="cuda")
+    dt_max = (delta[:, :3] - identity_delta[:, :3]).abs().max().item()
+    dq_max = (delta[:, 3:7] - identity_delta[:, 3:7]).abs().max().item()
+    fov_max = (delta[:, 7:] - identity_delta[:, 7:]).abs().max().item()
+    print(f"[render-cmp] init delta magnitude: dt_max={dt_max:.2e}, dq_max={dq_max:.2e}, fov_max={fov_max:.2e}")
+    assert dt_max < 1e-6 and dq_max < 1e-6, "init delta should be identity (zero-init final layer)"
+
+    # Stress test: zero rendered + zero weight → coverage=0 → delta must be identity.
+    zero_rendered = torch.zeros(B, P, 32, device="cuda")
+    zero_weight = torch.zeros(B, P, device="cuda")
+    delta_zero = head(current, zero_rendered, zero_weight, init_pose)
+    diff_to_id = (delta_zero - identity_delta).abs().max().item()
+    print(f"[render-cmp] zero-grid stress: delta diff to identity = {diff_to_id:.2e} (should be ~0)")
+
+    # Backward sanity.
+    loss = (delta[:, :3] - torch.tensor([0.1, 0.0, 0.0], device="cuda")).pow(2).sum()
+    loss.backward()
+    print(f"[render-cmp] backward OK")
+    print(f"[render-cmp] params: {sum(p.numel() for p in head.parameters()) / 1e3:.1f}K")
+    print(f"[render-cmp] PASS")

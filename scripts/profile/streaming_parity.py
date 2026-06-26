@@ -23,7 +23,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from vggt_mamba.models.aggregators import CrossFrameMamba, GraphedStreamingScan  # noqa: E402
-from vggt_mamba.models.geomamba import build_geomamba                            # noqa: E402
+from vggt_mamba.models.terrawm import build_terrawm                            # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
 def load_model(ckpt_path: Path, weights_root: Path):
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = ckpt["config"]
-    model = build_geomamba(
+    model = build_terrawm(
         cfg["encoder"], str(weights_root),
         n_intraframe_layers=cfg["model"]["n_intraframe_layers"],
         n_summary_tokens=cfg["model"]["n_summary_tokens"],

@@ -23,6 +23,8 @@ services:
       # /home/raghav/workspace/datasets) also resolves inside the container.
       - /home/raghav/workspace/datasets:/workspace/datasets
       - /home/raghav/workspace/datasets:/home/raghav/workspace/datasets:ro
+      # VGGT reference repo (for data-pipeline cross-check)
+      - /home/raghav/workspace/vggt:/workspace/vggt:ro
       # HuggingFace cache — persist across container restarts
       - ~/.cache/huggingface:/root/.cache/huggingface
       - ~/.cache/torch:/root/.cache/torch
@@ -32,9 +34,8 @@ services:
     ipc: host
     stdin_open: true
     tty: true
-    # Ports for jupyter / tensorboard / rerun
+    # Ports for jupyter / tensorboard. (rerun port 9876 left to the host viewer.)
     ports:
       - "8888:8888"
       - "6006:6006"
-      - "9876:9876"
     command: ["bash"]

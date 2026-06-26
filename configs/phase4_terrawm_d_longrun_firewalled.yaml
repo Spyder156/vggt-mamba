@@ -1,0 +1,135 @@
+# TerraWM-D long-run FIREWALLED — the actual clean test of scale+data+right-loss.
+#
+# The prior long-run config (configs/phase4_terrawm_d_longrun.yaml) had
+# `photometric_pose_gradient: true` + `w_render_l1: 2.0`, which together
+# opened and amplified the alternate gradient route into the pose head.
+# 40k steps of that recipe eroded the grid's structural role (ablation
+# post-reset Δt: 0.137 → 0.101 → 0.082m across pure1, photometric, long-run).
+# That erosion is the MECHANICALLY PREDICTED consequence of the config, not
+# evidence about the architecture under fair training.
+#
+# This config closes the bypass + reverts the amplification:
+#   - photometric_pose_gradient: FALSE  (photometric loss shapes grid features
+#     and ColorHead only; gradient does NOT flow into the pose head via render2)
+#   - w_render_l1: 1.0  (original weight; no amplification of the alternate
+#     gradient route into the pose head; depth-consistency is in the stack
+#     but not up-weighted)
+#
+# Everything else IDENTICAL to the long-run config so the comparison is clean:
+#   same 5 train seqs (sitting_xyz, fr1/xyz, fr1/desk, fr1/room, fr2/xyz),
+#   same fr2/desk held out, same [1, 5] stride, same 40k steps, same per-
+#   checkpoint long-horizon emergence check, same scale-inv pose loss.
+#
+# Warm-start: pure1 ckpt 8k (no bypass pollution in starting weights — the
+# photometric ckpt was trained with pose_gradient=true so its pose head is
+# already partly bypass-tuned; starting from pure1 gives the firewalled config
+# a clean pose head to work with). ColorHead initializes fresh — first ~hundred
+# steps the photometric loss will be high, same as the original photometric
+# retrain warm-start.
+#
+# Pre-registered branches:
+#
+#   Outcome A (firewalled run improves):
+#     held-out mean ATE drops meaningfully (≤1m at 40k vs 2.2m in bypass run),
+#     OR survival_1m moves out (≥500), OR collapse-frame moves out at any ckpt,
+#     AND ablation stays STRONG (≥0.10m)
+#     → the long-run "failure" was the bypass config, scale+data+right-loss
+#       WORKS. The architectural redesign was avoided.
+#
+#   Outcome B (firewalled run also fails):
+#     held-out ATE/survival/collapse-frame don't improve,
+#     BUT ablation HOLDS STRONG (≥0.10m, no erosion under firewalled config)
+#     → clean falsification of scale+data+right-loss. The collapse-frame-pinned-
+#       at-250 result combined with cleanly-protected grid says architecture
+#       IS the lever. Architectural redesign earned with no confound.
+#
+#   Outcome C (ablation erodes here too despite firewall):
+#     ablation drops below 0.10m in this run
+#     → there's a second bypass route I haven't identified (probably bootstrap_d
+#       differentiable-write geometry). Re-run with differentiable_write_geometry:
+#       false to isolate. This becomes the actual diagnostic, not the verdict.
+
+encoder: dinov3
+seed: 0
+
+data:
+  root: /workspace/datasets/tum_rgbd
+  n_frames: 8
+  stride_train: 8
+  stride_eval: 16
+  frame_stride: 5
+  randomize_stride: [1, 5]
+  depth_max_m: 8.0
+  train_seqs:
+    - rgbd_dataset_freiburg3_sitting_xyz
+    - rgbd_dataset_freiburg1_xyz
+    - rgbd_dataset_freiburg1_desk
+    - rgbd_dataset_freiburg1_room
+    - rgbd_dataset_freiburg2_xyz
+  eval_seqs: null
+  held_out_seq: rgbd_dataset_freiburg2_desk
+
+model:
+  n_intraframe_layers: 4
+  voxel_bounds: [-4.0, -4.0, -2.0, 4.0, 4.0, 8.0]
+  voxel_resolution: [64, 64, 64]
+  voxel_feature_dim: 32
+  n_render_samples: 64
+  render_near: 0.1
+  render_far: 8.0
+  bootstrap_hidden: 128
+  bootstrap_max_depth: 10.0
+  pose_head_hidden: 256
+  pose_max_dt: 1.0
+  pose_max_dq: 0.5
+  unwritten_mask_threshold: 0.001
+  use_write_confidence: true
+  write_confidence_hidden: 64
+  differentiable_write_geometry: true
+  use_photometric: true              # ColorHead trained, photometric loss in stack
+  photometric_hidden: 64
+  # === THE FIREWALL ===
+  photometric_pose_gradient: false   # CRITICAL: was TRUE in the confounded long-run.
+                                      # Photometric loss flows into voxel features
+                                      # + ColorHead, NOT into the pose head.
+
+loss:
+  # === DEPTH-CONSISTENCY AT ORIGINAL WEIGHT ===
+  w_render_l1: 1.0                   # was 2.0 in confounded long-run.
+                                      # render_l1 IS the depth-consistency loss;
+                                      # keep it as a clean signal at the original
+                                      # weight so it can't act as an amplified
+                                      # alternate route into the pose head.
+  w_render_log: 0.5
+  w_bootstrap: 1.0
+  w_pose: 1.0
+  w_mvc: 0.1
+  mvc_samples: 512
+  pose_scale_invariant: true
+  pose_w_scale_inv: 1.0
+  pose_w_cos: 1.0
+  pose_w_rot: 1.0
+  pose_w_fov: 0.1
+  pose_tracking: false
+  w_photometric: 1.0
+
+optim:
+  lr: 5.0e-5
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  warmup_steps: 200
+
+train:
+  steps: 40000
+  batch_size: 1
+  num_workers: 4
+  log_every: 50
+  eval_every: 1000
+  ckpt_every: 8000               # ckpts at 8k, 16k, 24k, 32k, 40k
+  diag_every: 200
+  img_every: 2000
+  tier4_every: 100
+  tensorboard: true
+  precision: bfloat16
+
+output_dir: experiments/phase4_terrawm_d_seed0_longrun_firewalled

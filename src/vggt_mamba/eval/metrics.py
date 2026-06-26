@@ -54,6 +54,45 @@ def normal_consistency(pred_normals: ArrayLike, gt_normals: ArrayLike) -> float:
 
 # ---------- Camera pose ----------
 
+def project_points_to_pixels(
+    world_points: torch.Tensor,
+    pose_w_c: torch.Tensor,
+    K: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pinhole-project 3D world points into camera pixels.
+
+    Args:
+        world_points: (..., N, 3) — points in world coordinates
+        pose_w_c:     (..., 4, 4) — world-from-camera transform (camera origin
+                      in world; rotation columns = camera basis in world).
+                      Same convention as TUM's pose_w_c.
+        K:            (..., 3, 3) — pinhole intrinsics at the same image
+                      resolution the pixels will be compared against.
+
+    Returns:
+        pixels: (..., N, 2) projected pixel (u, v).
+        in_front: (..., N) bool — True iff point is in front of the camera (Z>0).
+
+    Convention: pose_w_c maps camera-frame points to world. To go world→camera
+    we invert it. For a rigid SE(3) transform that's R.T applied to (P - t).
+    """
+    R_wc = pose_w_c[..., :3, :3]                    # (..., 3, 3)
+    t_wc = pose_w_c[..., :3, 3]                     # (..., 3)
+    # camera-from-world: rotate by R_wc^T, then subtract camera origin
+    P_centered = world_points - t_wc.unsqueeze(-2)  # (..., N, 3)
+    # Apply R_wc^T: (... 3 3) @ (... N 3)^T → (... 3 N) → transpose to (... N 3)
+    P_cam = torch.einsum("...ij,...nj->...ni", R_wc.transpose(-2, -1), P_centered)
+    z = P_cam[..., 2]                                # (..., N)
+    in_front = z > 1e-6
+    z_safe = z.clamp_min(1e-6)
+    # Pinhole: pixel = K @ (P_cam / z)
+    P_norm = P_cam / z_safe.unsqueeze(-1)            # (..., N, 3), homogeneous = (x/z, y/z, 1)
+    # K @ P_norm^T → (..., 3, N) → transpose → (..., N, 3), take first 2 dims
+    pixels_h = torch.einsum("...ij,...nj->...ni", K, P_norm)
+    pixels = pixels_h[..., :2]
+    return pixels, in_front
+
+
 def umeyama_sim3(P: np.ndarray, Q: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
     """Sim(3) alignment of point set P to Q (Umeyama 1991).
 
