@@ -1,0 +1,56 @@
+# TerraWM-Linear V1 training config (Path A — accept scale ambiguity).
+#
+# Loss: L1 on normalized translation + L1 on quaternion (sign-disambiguated) +
+#       L1 on FoV + L1 on normalized depth.
+# GT is normalized per-batch by mean-point-distance (VGGT-style) so the model
+# learns in scale-normalized space.
+# Eval every eval_every steps using scripts/eval/terrawm_linear_held_out.py.
+
+experiment:
+  name: terrawm_linear_v1
+  output_dir: experiments/terrawm_linear_v1
+  seed: 42
+
+model:
+  img_size: 512
+  d_enc: 1024                    # DINOv3 ViT-L/16
+  d_model: 768
+  n_heads: 12
+  n_latents: 512
+  n_write_blocks: 4
+  n_decode_blocks: 2
+  encoder_repo: facebook/dinov3-vitl16-pretrain-lvd1689m
+  freeze_encoder: true
+  max_frames: 64                 # frame-index embedding table size
+
+data:
+  data_root: /workspace/datasets/tum_rgbd
+  n_frames: 4                    # per training window
+  stride: 8                      # gap between windows
+  frame_stride: 10               # default intra-window stride
+  randomize_stride: [5, 15]      # if set, sample stride per window uniformly
+  img_size: 512
+  depth_max_m: 8.0
+  num_workers: 4
+  batch_size: 1
+
+train:
+  n_steps: 20000
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  grad_clip: 1.0
+  log_every: 50
+  eval_every: 2000
+  ckpt_every: 2000
+  use_bf16: true                 # forward + backward in bf16 autocast
+
+eval:
+  seq: rgbd_dataset_freiburg3_walking_xyz
+  n_frames: 16
+
+loss:
+  w_trans: 1.0                   # L1 on translation (normalized)
+  w_quat:  1.0                   # L1 on quaternion (sign-disambiguated)
+  w_fov:   0.1                   # L1 on FoV (radians)
+  w_depth: 1.0                   # L1 on normalized depth (valid pixels only)
