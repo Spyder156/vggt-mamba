@@ -1,0 +1,50 @@
+# Smoke config — tiny model, 3 steps, no eval. Use to verify the trainer runs.
+
+experiment:
+  name: terrawm_linear_smoke
+  output_dir: experiments/terrawm_linear_smoke
+  seed: 0
+
+model:
+  img_size: 512
+  d_enc: 1024
+  d_model: 384
+  n_heads: 8
+  n_latents: 128
+  n_write_blocks: 2
+  n_decode_blocks: 2
+  encoder_repo: facebook/dinov3-vitl16-pretrain-lvd1689m
+  freeze_encoder: true
+  max_frames: 32
+
+data:
+  data_root: /workspace/datasets/tum_rgbd
+  n_frames: 4
+  stride: 8
+  frame_stride: 10
+  randomize_stride: null
+  img_size: 512
+  depth_max_m: 8.0
+  num_workers: 0
+  batch_size: 1
+
+train:
+  n_steps: 3
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 0
+  grad_clip: 1.0
+  log_every: 1
+  eval_every: 999999          # disable eval in smoke
+  ckpt_every: 999999          # disable ckpt in smoke
+  use_bf16: true
+
+eval:
+  seq: rgbd_dataset_freiburg3_walking_xyz
+  n_frames: 8
+
+loss:
+  w_trans: 1.0
+  w_quat: 1.0
+  w_fov: 0.1
+  w_depth: 1.0
