@@ -1,0 +1,67 @@
+# TerraWM-Linear cheat-pose config (depth-only training, GT pose fed in).
+#
+# Tests whether the reconstruction half can learn to produce 3D-consistent
+# depth when given correct poses. The model's pose head still runs but its
+# loss is dropped (pose-supervision is supplied by the WRITE-step conditioning,
+# not by gradient).
+#
+# Pass criterion:
+#   - 3D loss (multi-view Chamfer of pred-depth back-projected through GT pose)
+#     drops substantially during training
+#   - depth abs_rel at eval drops to ~10–15% on static held-out
+# Fail criterion:
+#   - 3D loss is sticky despite GT pose being given — depth half can't learn
+#   - We then look at architecture (bigger latents, DPT head, etc.)
+
+experiment:
+  name: terrawm_linear_cheatpose
+  output_dir: experiments/terrawm_linear_cheatpose
+  seed: 42
+
+model:
+  img_size: 512
+  d_enc: 1024
+  d_model: 768
+  n_heads: 12
+  n_latents: 512
+  n_write_blocks: 4
+  n_decode_blocks: 2
+  encoder_repo: facebook/dinov3-vitl16-pretrain-lvd1689m
+  freeze_encoder: true
+  max_frames: 64
+  pose_supervision_mode: gt_replace   # <- key change: GT pose fed into WRITE
+
+data:
+  data_root: /workspace/datasets/tum_rgbd
+  n_frames: 4
+  stride: 8
+  frame_stride: 10
+  randomize_stride: [5, 15]
+  img_size: 512
+  depth_max_m: 8.0
+  num_workers: 4
+  batch_size: 1
+
+train:
+  n_steps: 20000
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  warmup_steps: 500
+  grad_clip: 1.0
+  log_every: 50
+  eval_every: 2000
+  ckpt_every: 2000
+  use_bf16: true
+
+eval:
+  seq: rgbd_dataset_freiburg3_sitting_static
+  n_frames: 16
+
+loss:
+  # Pose losses are zeroed automatically when pose_supervision_mode='gt_replace'
+  w_trans: 0.0
+  w_quat:  0.0
+  w_fov:   0.0
+  w_depth: 1.0
+  w_3d:    10.0                  # 3D consistency boosted — primary signal in cheat mode
+  n_3d_samples: 512
