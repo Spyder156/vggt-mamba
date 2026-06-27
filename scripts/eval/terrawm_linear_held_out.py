@@ -109,6 +109,9 @@ def main():
     p.add_argument("--n-latents", type=int, default=512)
     p.add_argument("--n-write-blocks", type=int, default=4)
     p.add_argument("--n-decode-blocks", type=int, default=2)
+    p.add_argument("--rrd-path", type=str, default=None,
+                    help="If set, also write a Rerun .rrd with predicted+GT cameras and "
+                         "point clouds (Sim(3)-aligned predicted on top of TUM-metric GT).")
     args = p.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -160,9 +163,35 @@ def main():
 
     batch = load_frames(args.seq, args.n_frames, args.img_size)
     rgb = batch["rgb"].unsqueeze(0).to(device)                                        # (1, T, 3, H, W)
+    pose_w_c_b = batch["pose_w_c"].unsqueeze(0).to(device)                            # (1, T, 4, 4)
+    depth_b = batch["depth"].unsqueeze(0).to(device)                                  # (1, T, H, W)
+    valid_b = batch["valid"].unsqueeze(0).to(device)
+    K_b = batch["K"].unsqueeze(0).to(device)                                          # (1, 3, 3)
+
+    # Cheat-pose mode: feed normalized GT pose enc into the model.
+    pose_mode = getattr(cfg, "pose_supervision_mode", "predicted")
+    gt_pose_enc_in = None
+    if pose_mode == "gt_replace":
+        from vggt_mamba.eval.normalize import normalize_scene_by_mean_distance
+        from vggt_mamba.eval.pose_enc import (
+            fov_from_intrinsics as _fov_fn,
+            world_from_cam_to_pose_enc as _to_pose_enc,
+        )
+        pose_normed, _, _ = normalize_scene_by_mean_distance(
+            pose_w_c_b.float(), depth_b.float(), valid_b, K_b.float()
+        )
+        T = pose_normed.shape[1]
+        fh, fw = _fov_fn(K_b, (args.img_size, args.img_size))
+        gt_pose_enc_in = _to_pose_enc(
+            pose_normed, fh[:, None].expand(1, T), fw[:, None].expand(1, T)
+        )
+        print(f"feeding GT pose enc into model (gt_replace mode)")
 
     with torch.no_grad():
-        out = model(rgb)
+        if gt_pose_enc_in is not None:
+            out = model(rgb, gt_pose_enc=gt_pose_enc_in)
+        else:
+            out = model(rgb)
     cameras = out["cameras"][0].float().cpu()                                         # (T, 9)
     depths = out["depths"][0].float().cpu()                                           # (T, H, W)
 
@@ -202,6 +231,171 @@ def main():
     print()
     print(f"  EXPECTED FOR UNTRAINED MODEL: huge numbers, this is just plumbing check.")
     print(f"  Once we start training, ATE Sim(3) is the headline metric.")
+
+    # === Optional Rerun visualization ===
+    if args.rrd_path is not None:
+        write_rerun_rrd(
+            args.rrd_path,
+            seq=args.seq,
+            recs_idx=batch["frame_indices"],
+            images=batch["rgb"].numpy(),                                              # (T, 3, H, W) in [0,1]
+            pred_pose_w_c=pred_pose_w_c,                                              # (T, 4, 4)
+            gt_pose_w_c=gt_pose_w_c,
+            pred_depth=pred_d_np,                                                     # (T, H, W) normalized
+            gt_depth=gt_d_np,                                                         # (T, H, W) metric
+            valid=valid_np,
+            pred_intrinsics=pose_enc_to_K_per_frame(cameras, args.img_size),
+            gt_K=batch["K"].numpy(),
+            img_size=args.img_size,
+        )
+        print(f"  RRD: wrote {args.rrd_path}")
+
+
+# ============================================================================
+# Rerun visualization
+# ============================================================================
+
+def pose_enc_to_K_per_frame(cameras: torch.Tensor, img_size: int) -> np.ndarray:
+    """Decode predicted (T, 9) cam-from-world pose enc into per-frame 3x3 K."""
+    from vggt_mamba.eval.pose_enc import pose_enc_to_intrinsics
+    K = pose_enc_to_intrinsics(cameras, (img_size, img_size)).numpy()                  # (T, 3, 3)
+    return K
+
+
+def umeyama_sim3_np(P: np.ndarray, Q: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Reuse the metrics.py implementation."""
+    from vggt_mamba.eval.metrics import umeyama_sim3
+    return umeyama_sim3(P, Q)
+
+
+def backproject_depth_to_world(
+    depth: np.ndarray, valid: np.ndarray, K: np.ndarray, pose_w_c: np.ndarray
+) -> np.ndarray:
+    """Single-frame back-projection: depth + K + cam-to-world -> (M, 3) world points."""
+    H, W = depth.shape
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    us, vs = np.meshgrid(np.arange(W), np.arange(H))
+    mask = valid & (depth > 1e-3)
+    uu = us[mask].astype(np.float32)
+    vv = vs[mask].astype(np.float32)
+    dd = depth[mask]
+    x_cam = (uu - cx) * dd / fx
+    y_cam = (vv - cy) * dd / fy
+    z_cam = dd
+    P_cam = np.stack([x_cam, y_cam, z_cam], axis=-1)
+    R = pose_w_c[:3, :3]
+    t = pose_w_c[:3, 3]
+    return P_cam @ R.T + t
+
+
+def write_rerun_rrd(
+    rrd_path: str,
+    *,
+    seq: str,
+    recs_idx: list[int],
+    images: np.ndarray,                                                                # (T, 3, H, W) [0,1]
+    pred_pose_w_c: np.ndarray,                                                         # (T, 4, 4) in MODEL (normalized) scale
+    gt_pose_w_c: np.ndarray,                                                           # (T, 4, 4) in TUM metric
+    pred_depth: np.ndarray,                                                            # (T, H, W) MODEL scale
+    gt_depth: np.ndarray,                                                              # (T, H, W) TUM metric
+    valid: np.ndarray,                                                                 # (T, H, W) bool
+    pred_intrinsics: np.ndarray,                                                       # (T, 3, 3) — VGGT's predicted K (center PP)
+    gt_K: np.ndarray,                                                                  # (3, 3) — TUM K
+    img_size: int,
+) -> None:
+    """Write a Rerun .rrd with:
+        world/points_pred_aligned : predicted cloud Sim(3)-aligned to TUM metric (one cloud)
+        world/points_gt           : GT cloud in TUM metric (one cloud)
+        world/cam_pred_aligned[i] : predicted cameras after Sim(3) align, animated
+        world/cam_gt[i]           : GT cameras, animated
+    """
+    import rerun as rr
+    from pathlib import Path
+
+    Path(rrd_path).parent.mkdir(parents=True, exist_ok=True)
+    rr.init("terrawm_linear_held_out", spawn=False)
+    rr.save(rrd_path)
+    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
+
+    T = pred_pose_w_c.shape[0]
+
+    # --- Sim(3) align predicted cam centers to GT cam centers ---
+    pred_centers = pred_pose_w_c[:, :3, 3]                                              # (T, 3)
+    gt_centers = gt_pose_w_c[:, :3, 3]
+    s, R_align, t_align = umeyama_sim3_np(pred_centers, gt_centers)
+    # Apply to predicted poses
+    pred_pose_aligned = pred_pose_w_c.copy()
+    for i in range(T):
+        R_pred = pred_pose_w_c[i, :3, :3]
+        t_pred = pred_pose_w_c[i, :3, 3]
+        pred_pose_aligned[i, :3, :3] = R_align @ R_pred
+        pred_pose_aligned[i, :3, 3] = s * (R_align @ t_pred) + t_align
+    # Apply the same similarity to predicted depth (scale only) and re-build pred K
+    # — we just scale depth by s when back-projecting so points land in TUM frame.
+
+    # --- Build global point clouds (merged across all frames) ---
+    pred_pts_all, pred_cols_all = [], []
+    gt_pts_all, gt_cols_all = [], []
+    for i in range(T):
+        rgb_u8 = (images[i].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)     # (H, W, 3)
+
+        # predicted: backproject pred_depth * s through pred K with pred_pose_aligned
+        K_pred = pred_intrinsics[i]
+        pred_pts = backproject_depth_to_world(
+            pred_depth[i] * s, valid[i], K_pred, pred_pose_aligned[i]
+        )
+        valid_mask = valid[i] & (pred_depth[i] > 1e-3)
+        pred_cols = rgb_u8[valid_mask]
+        pred_pts_all.append(pred_pts)
+        pred_cols_all.append(pred_cols)
+
+        # GT: backproject gt_depth through gt_K with gt_pose
+        gt_pts = backproject_depth_to_world(gt_depth[i], valid[i], gt_K, gt_pose_w_c[i])
+        gt_valid_mask = valid[i] & (gt_depth[i] > 1e-3)
+        gt_cols = rgb_u8[gt_valid_mask]
+        gt_pts_all.append(gt_pts)
+        gt_cols_all.append(gt_cols)
+
+    # Concatenate + cap at 2M points each for viewer perf
+    def cap(pts_list, cols_list, max_n=2_000_000):
+        pts = np.concatenate(pts_list)
+        cols = np.concatenate(cols_list)
+        if len(pts) > max_n:
+            idx = np.random.choice(len(pts), max_n, replace=False)
+            pts, cols = pts[idx], cols[idx]
+        return pts, cols
+
+    pred_pts_g, pred_cols_g = cap(pred_pts_all, pred_cols_all)
+    gt_pts_g, gt_cols_g = cap(gt_pts_all, gt_cols_all)
+
+    rr.log("world/points_pred_aligned",
+            rr.Points3D(pred_pts_g, colors=pred_cols_g, radii=0.003), static=True)
+    rr.log("world/points_gt",
+            rr.Points3D(gt_pts_g, colors=gt_cols_g, radii=0.003), static=True)
+
+    # --- Per-frame cameras on the timeline ---
+    for i in range(T):
+        rr.set_time_sequence("frame", i)
+        rgb_u8 = (images[i].transpose(1, 2, 0) * 255).clip(0, 255).astype(np.uint8)
+
+        # Predicted aligned camera
+        P = pred_pose_aligned[i]
+        rr.log("world/cam_pred_aligned",
+                rr.Transform3D(translation=P[:3, 3], mat3x3=P[:3, :3]))
+        rr.log("world/cam_pred_aligned/image",
+                rr.Pinhole(image_from_camera=pred_intrinsics[i],
+                           width=img_size, height=img_size, image_plane_distance=0.1))
+        rr.log("world/cam_pred_aligned/image", rr.Image(rgb_u8))
+
+        # GT camera
+        P = gt_pose_w_c[i]
+        rr.log("world/cam_gt",
+                rr.Transform3D(translation=P[:3, 3], mat3x3=P[:3, :3]))
+        rr.log("world/cam_gt/image",
+                rr.Pinhole(image_from_camera=gt_K,
+                           width=img_size, height=img_size, image_plane_distance=0.1))
+        rr.log("world/cam_gt/image", rr.Image(rgb_u8))
 
 
 if __name__ == "__main__":

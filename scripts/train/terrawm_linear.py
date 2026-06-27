@@ -35,7 +35,11 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from vggt_mamba.data.tum_rgbd import TUMRGBDDataset
-from vggt_mamba.eval.normalize import normalize_scene_by_mean_distance
+from vggt_mamba.eval.metrics import chamfer_distance_torch, sample_valid_points
+from vggt_mamba.eval.normalize import (
+    back_project_depth_to_world,
+    normalize_scene_by_mean_distance,
+)
 from vggt_mamba.eval.pose_enc import (
     fov_from_intrinsics,
     world_from_cam_to_pose_enc,
@@ -50,6 +54,35 @@ def quaternion_l1_loss(pred_q: torch.Tensor, gt_q: torch.Tensor) -> torch.Tensor
     diff_pos = (pred_q - gt_q).abs().sum(dim=-1)
     diff_neg = (pred_q + gt_q).abs().sum(dim=-1)
     return torch.minimum(diff_pos, diff_neg).mean()
+
+
+def multi_view_3d_chamfer(
+    pred_depth: torch.Tensor,        # (B, T, H, W) — model's normalized depth
+    valid: torch.Tensor,             # (B, T, H, W) bool
+    pose_normed_w_c: torch.Tensor,   # (B, T, 4, 4) — normalized GT world-from-cam
+    K: torch.Tensor,                 # (B, 3, 3)
+    n_samples: int = 512,
+) -> torch.Tensor:
+    """Multi-view 3D consistency: back-project predicted depth via GT pose,
+    sample valid points per frame, average pairwise Chamfer across (i, j).
+
+    Forces depth to be 3D-coherent across views — the single strongest signal
+    for monocular depth. Uses GT pose (cheat-pose Flavor A) so the constraint
+    only depends on whether depth is right.
+    """
+    world_pts = back_project_depth_to_world(pred_depth, valid, K, pose_normed_w_c)  # (B, T, H, W, 3)
+    # Move to (B, T, 3, H, W) for sample_valid_points
+    pts_for_sample = world_pts.permute(0, 1, 4, 2, 3).contiguous()
+    sampled = sample_valid_points(pts_for_sample, valid, n_samples)                  # (B, T, N, 3)
+
+    T = sampled.shape[1]
+    pair_losses = []
+    for i in range(T):
+        for j in range(i + 1, T):
+            pair_losses.append(chamfer_distance_torch(sampled[:, i], sampled[:, j]))
+    if not pair_losses:
+        return sampled.new_zeros(())
+    return torch.stack(pair_losses).mean()
 
 
 def cosine_warmup_lr(step: int, n_steps: int, warmup: int, max_lr: float) -> float:
@@ -174,11 +207,17 @@ def main():
         persistent_workers=cfg["data"]["num_workers"] > 0,
     )
 
-    # --- loss weights ---
+    # --- loss weights + mode ---
     w_t = cfg["loss"]["w_trans"]
     w_q = cfg["loss"]["w_quat"]
     w_f = cfg["loss"]["w_fov"]
     w_d = cfg["loss"]["w_depth"]
+    w_3d = cfg["loss"].get("w_3d", 0.0)
+    n_3d_samples = cfg["loss"].get("n_3d_samples", 512)
+
+    pose_mode = cfg["model"].get("pose_supervision_mode", "predicted")
+    print(f"pose_supervision_mode: {pose_mode}")
+    print(f"loss weights: t={w_t} q={w_q} fov={w_f} d={w_d} 3d={w_3d}")
 
     use_bf16 = cfg["train"]["use_bf16"]
     n_steps = cfg["train"]["n_steps"]
@@ -231,26 +270,45 @@ def main():
             pg["lr"] = lr_now
 
         with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_bf16):
-            out = model(rgb)
+            if pose_mode == "gt_replace":
+                out = model(rgb, gt_pose_enc=gt_pose_enc)
+            else:
+                out = model(rgb)
 
         cams_pred = out["cameras"].float()                                              # (B, T, 9)
         depths_pred = out["depths"].float()                                              # (B, T, H, W)
 
-        # --- losses ---
-        loss_trans = (cams_pred[..., :3] - gt_pose_enc[..., :3]).abs().mean()
-        loss_quat = quaternion_l1_loss(cams_pred[..., 3:7], gt_pose_enc[..., 3:7])
-        loss_fov = (cams_pred[..., 7:] - gt_pose_enc[..., 7:]).abs().mean()
+        # --- pose losses (disabled in gt_replace mode) ---
+        if pose_mode == "gt_replace":
+            zero = depths_pred.new_zeros(())
+            loss_trans = zero
+            loss_quat = zero
+            loss_fov = zero
+        else:
+            loss_trans = (cams_pred[..., :3] - gt_pose_enc[..., :3]).abs().mean()
+            loss_quat = quaternion_l1_loss(cams_pred[..., 3:7], gt_pose_enc[..., 3:7])
+            loss_fov = (cams_pred[..., 7:] - gt_pose_enc[..., 7:]).abs().mean()
 
+        # --- depth L1 ---
         valid_mask = valid.float()
         denom = valid_mask.sum().clamp(min=1.0)
         depth_diff = (depths_pred - depth_normed).abs() * valid_mask
         loss_depth = depth_diff.sum() / denom
+
+        # --- 3D consistency (back-project pred depth via GT pose) ---
+        if w_3d > 0:
+            loss_3d = multi_view_3d_chamfer(
+                depths_pred, valid, pose_normed, K.float(), n_samples=n_3d_samples
+            )
+        else:
+            loss_3d = depths_pred.new_zeros(())
 
         loss = (
             w_t * loss_trans
             + w_q * loss_quat
             + w_f * loss_fov
             + w_d * loss_depth
+            + w_3d * loss_3d
         )
 
         loss.backward()
@@ -269,7 +327,8 @@ def main():
                 f"[step {step:>5d}/{n_steps}] "
                 f"loss={loss.item():.4f}  "
                 f"(t={loss_trans.item():.3f} q={loss_quat.item():.3f} "
-                f"fov={loss_fov.item():.3f} d={loss_depth.item():.3f})  "
+                f"fov={loss_fov.item():.3f} d={loss_depth.item():.3f} "
+                f"3d={loss_3d.item():.3f})  "
                 f"lr={lr_now:.2e}  "
                 f"sps={sps:.2f}  "
                 f"elapsed={elapsed/60:.1f}m"
