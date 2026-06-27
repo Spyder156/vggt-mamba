@@ -179,6 +179,12 @@ class TerraWMConfig:
     encoder_repo: str = "facebook/dinov3-vitl16-pretrain-lvd1689m"
     freeze_encoder: bool = True
     max_frames: int = 64                                                               # for frame-index embedding table
+    # Cheat-pose mode. "predicted": pose head is the only source of pose at
+    # train/eval. "gt_replace": GT pose enc is fed INTO the WRITE step as a
+    # per-frame conditioning vector — the depth half learns with geometry as
+    # given. Pose head still runs (and its output is returned) but its loss
+    # is up to the trainer.
+    pose_supervision_mode: str = "predicted"                                          # "predicted" | "gt_replace"
 
 
 class TerraWMLinear(nn.Module):
@@ -233,18 +239,40 @@ class TerraWMLinear(nn.Module):
         self.camera_head = CameraHead(cfg.d_model)
         self.depth_head = DepthHead(cfg.d_model, self.grid, cfg.img_size)
 
+        # Pose embedder — used only when pose_supervision_mode='gt_replace'.
+        # 9-d normalized pose enc → d_model. Added to each frame's patches at
+        # WRITE time, so the latent state sees both image content AND geometry.
+        self.pose_embedder = nn.Linear(9, cfg.d_model)
+        # Zero-init so a model trained without it still works after we add it.
+        nn.init.zeros_(self.pose_embedder.weight)
+        nn.init.zeros_(self.pose_embedder.bias)
+
     # ------------------------------------------------------------------
     def init_state(self, batch_size: int) -> torch.Tensor:
         """Return a fresh latent state for a new sequence."""
         return self.latents_init.expand(batch_size, -1, -1).contiguous()
 
     # ------------------------------------------------------------------
-    def encode_frame(self, rgb: torch.Tensor, frame_idx: int) -> torch.Tensor:
-        """rgb: (B, 3, H, W) -> patches: (B, P, D_model) with pos+frame embedding."""
+    def encode_frame(
+        self,
+        rgb: torch.Tensor,
+        frame_idx: int,
+        gt_pose_enc_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """rgb: (B, 3, H, W) -> patches: (B, P, D_model) with pos + frame +
+        (optional) pose embedding.
+
+        gt_pose_enc_t: (B, 9) — only used when pose_supervision_mode='gt_replace'.
+            When supplied, its embedding is added to every patch so the WRITE
+            step sees pose context.
+        """
         enc_out = self.encoder(rgb)                                                    # (B, P, D_enc)
         patches = self.patch_proj(enc_out.patches)                                     # (B, P, D_model)
         patches = patches + self.patch_pos_embed
         patches = patches + self.frame_embed[frame_idx][None, None, :]                 # broadcast (D,) -> (1,1,D)
+        if gt_pose_enc_t is not None and self.cfg.pose_supervision_mode == "gt_replace":
+            pose_emb = self.pose_embedder(gt_pose_enc_t)                               # (B, D_model)
+            patches = patches + pose_emb[:, None, :]                                   # broadcast over patches
         return patches
 
     # ------------------------------------------------------------------
@@ -283,25 +311,33 @@ class TerraWMLinear(nn.Module):
         return cam_pred, depth
 
     # ------------------------------------------------------------------
-    def forward(self, rgb_seq: torch.Tensor) -> dict:
+    def forward(
+        self, rgb_seq: torch.Tensor, gt_pose_enc: torch.Tensor | None = None
+    ) -> dict:
         """rgb_seq: (B, T, 3, H, W) — sequence forward.
+
+        gt_pose_enc: (B, T, 9) — only used when pose_supervision_mode='gt_replace'.
+            Should be the NORMALIZED GT pose encoding (after the train-time
+            mean-distance normalization) so its scale matches model outputs.
 
         Returns dict with:
             cameras: (B, T, 9)
             depths:  (B, T, H, W)
+            latents: (B, M, D)
         """
         B, T, C, H, W = rgb_seq.shape
         assert H == self.cfg.img_size and W == self.cfg.img_size, (
             f"input must be square {self.cfg.img_size}x{self.cfg.img_size}, got {H}x{W}"
         )
+        if self.cfg.pose_supervision_mode == "gt_replace" and gt_pose_enc is None:
+            raise ValueError("pose_supervision_mode='gt_replace' requires gt_pose_enc")
         latents = self.init_state(B)
 
         # WRITE all frames
-        patch_cache: list[torch.Tensor] = []                                            # for decode pass
         for t in range(T):
-            patches = self.encode_frame(rgb_seq[:, t], t)                              # (B, P, D)
+            pose_t = gt_pose_enc[:, t] if gt_pose_enc is not None else None
+            patches = self.encode_frame(rgb_seq[:, t], t, gt_pose_enc_t=pose_t)         # (B, P, D)
             latents = self.write_step(latents, patches)
-            patch_cache.append(patches)                                                # not strictly needed for V1
 
         # DECODE per frame (camera + depth)
         cams = []
