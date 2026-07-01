@@ -142,8 +142,10 @@ def main():
             encoder_repo=m.get("encoder_repo", "facebook/dinov3-vitl16-pretrain-lvd1689m"),
             freeze_encoder=m.get("freeze_encoder", True),
             max_frames=m.get("max_frames", 64),
+            pose_supervision_mode=m.get("pose_supervision_mode", "predicted"),
         )
-        print(f"using model cfg from ckpt (max_frames={cfg.max_frames}, d_model={cfg.d_model})")
+        print(f"using model cfg from ckpt (pose_mode={cfg.pose_supervision_mode}, "
+                f"max_frames={cfg.max_frames}, d_model={cfg.d_model})")
     else:
         cfg = TerraWMConfig(
             img_size=args.img_size,
@@ -234,19 +236,31 @@ def main():
 
     # === Optional Rerun visualization ===
     if args.rrd_path is not None:
+        # In gt_replace mode the pose head got zero gradient — its predicted
+        # cameras are meaningless. What we ACTUALLY want to look at is:
+        # "given correct poses (which we fed the model), what depth did it
+        # produce?" So we use GT poses for both cam viz AND for back-projecting
+        # the predicted depth. In predicted mode we keep pred poses.
+        if pose_mode == "gt_replace":
+            pred_pose_for_viz = gt_pose_w_c
+            pred_K_for_viz = batch["K"].numpy()[None].repeat(gt_pose_w_c.shape[0], axis=0)
+        else:
+            pred_pose_for_viz = pred_pose_w_c
+            pred_K_for_viz = pose_enc_to_K_per_frame(cameras, args.img_size)
         write_rerun_rrd(
             args.rrd_path,
             seq=args.seq,
             recs_idx=batch["frame_indices"],
             images=batch["rgb"].numpy(),                                              # (T, 3, H, W) in [0,1]
-            pred_pose_w_c=pred_pose_w_c,                                              # (T, 4, 4)
+            pred_pose_w_c=pred_pose_for_viz,                                          # (T, 4, 4)
             gt_pose_w_c=gt_pose_w_c,
             pred_depth=pred_d_np,                                                     # (T, H, W) normalized
             gt_depth=gt_d_np,                                                         # (T, H, W) metric
             valid=valid_np,
-            pred_intrinsics=pose_enc_to_K_per_frame(cameras, args.img_size),
+            pred_intrinsics=pred_K_for_viz,
             gt_K=batch["K"].numpy(),
             img_size=args.img_size,
+            skip_sim3_align=(pose_mode == "gt_replace"),
         )
         print(f"  RRD: wrote {args.rrd_path}")
 
@@ -303,12 +317,17 @@ def write_rerun_rrd(
     pred_intrinsics: np.ndarray,                                                       # (T, 3, 3) — VGGT's predicted K (center PP)
     gt_K: np.ndarray,                                                                  # (3, 3) — TUM K
     img_size: int,
+    skip_sim3_align: bool = False,                                                     # cheatpose mode: pred cams ARE GT already
 ) -> None:
     """Write a Rerun .rrd with:
-        world/points_pred_aligned : predicted cloud Sim(3)-aligned to TUM metric (one cloud)
+        world/points_pred_aligned : predicted cloud, aligned to TUM metric (one cloud)
         world/points_gt           : GT cloud in TUM metric (one cloud)
-        world/cam_pred_aligned[i] : predicted cameras after Sim(3) align, animated
+        world/cam_pred_aligned[i] : predicted cameras (Sim(3) or GT-as-fed), animated
         world/cam_gt[i]           : GT cameras, animated
+
+    skip_sim3_align: if True (cheatpose mode), the pred_pose_w_c IS the GT pose
+        that was fed into the model, so no Umeyama needed. We instead fit a single
+        scalar between pred_depth and gt_depth to bring pred depth into metric.
     """
     import rerun as rr
     from pathlib import Path
@@ -320,19 +339,26 @@ def write_rerun_rrd(
 
     T = pred_pose_w_c.shape[0]
 
-    # --- Sim(3) align predicted cam centers to GT cam centers ---
-    pred_centers = pred_pose_w_c[:, :3, 3]                                              # (T, 3)
-    gt_centers = gt_pose_w_c[:, :3, 3]
-    s, R_align, t_align = umeyama_sim3_np(pred_centers, gt_centers)
-    # Apply to predicted poses
-    pred_pose_aligned = pred_pose_w_c.copy()
-    for i in range(T):
-        R_pred = pred_pose_w_c[i, :3, :3]
-        t_pred = pred_pose_w_c[i, :3, 3]
-        pred_pose_aligned[i, :3, :3] = R_align @ R_pred
-        pred_pose_aligned[i, :3, 3] = s * (R_align @ t_pred) + t_align
-    # Apply the same similarity to predicted depth (scale only) and re-build pred K
-    # — we just scale depth by s when back-projecting so points land in TUM frame.
+    if skip_sim3_align:
+        # cheatpose: cams stay as fed. scale predicted depth to metric via a
+        # single scalar minimising ||s*pred - gt||^2 over valid pixels.
+        p_flat = pred_depth[valid]
+        g_flat = gt_depth[valid]
+        s = float((p_flat @ g_flat) / max((p_flat @ p_flat), 1e-12))
+        pred_pose_aligned = pred_pose_w_c.copy()
+        print(f"  [rrd cheatpose] depth-fit scale s = {s:.4f}, cams = GT (no Umeyama)")
+    else:
+        # predicted mode: Sim(3)-align pred cams to GT cams, use same s for depth.
+        pred_centers = pred_pose_w_c[:, :3, 3]
+        gt_centers = gt_pose_w_c[:, :3, 3]
+        s, R_align, t_align = umeyama_sim3_np(pred_centers, gt_centers)
+        pred_pose_aligned = pred_pose_w_c.copy()
+        for i in range(T):
+            R_pred = pred_pose_w_c[i, :3, :3]
+            t_pred = pred_pose_w_c[i, :3, 3]
+            pred_pose_aligned[i, :3, :3] = R_align @ R_pred
+            pred_pose_aligned[i, :3, 3] = s * (R_align @ t_pred) + t_align
+        print(f"  [rrd predicted] Sim(3) scale s = {s:.4f}")
 
     # --- Build global point clouds (merged across all frames) ---
     pred_pts_all, pred_cols_all = [], []
